@@ -1,0 +1,562 @@
+CHORD PROGRESSION RULE SYSTEM
+For software that builds progressions in a given scale and genre.
+===============================================================
+
+
+═══════════════════════════════════════════════════════════════
+PART 1: SCALES
+═══════════════════════════════════════════════════════════════
+
+Each scale is defined by its interval pattern from the root.
+W = whole step (2 semitones), H = half step (1 semitone), A = augmented 2nd (3 semitones).
+
+1.1 MAJOR (Ionian)
+  Pattern:    W W H W W W H
+  Notes (C):  C D E F G A B
+  Character:  Bright, stable, resolved.
+
+1.2 NATURAL MINOR (Aeolian)
+  Pattern:    W H W W H W W
+  Notes (A):  A B C D E F G
+  Character:  Dark, melancholic, familiar.
+
+1.3 DORIAN
+  Pattern:    W H W W W H W
+  Notes (D):  D E F G A B C
+  Character:  Minor with raised 6th. Bittersweet, modern minor.
+  Relation:   Mode 2 of major scale.
+
+1.4 MIXOLYDIAN
+  Pattern:    W W H W W H W
+  Notes (G):  G A B C D E F
+  Character:  Major with flat 7th. Unresolved, bluesy.
+  Relation:   Mode 5 of major scale.
+
+1.5 LYDIAN
+  Pattern:    W W W H W W H
+  Notes (F):  F G A B C D E
+  Character:  Major with raised 4th. Dreamy, floating.
+  Relation:   Mode 4 of major scale.
+
+1.6 HARMONIC MINOR
+  Pattern:    W H W W H A H
+  Notes (A):  A B C D E F G#
+  Character:  Natural minor with raised 7th. Dramatic, classical.
+  Special:    Produces a natural V7 dominant. Augmented 2nd interval (F→G#) gives exotic color.
+
+1.7 MELODIC MINOR
+  Pattern:    W H W W W W H
+  Notes (A):  A B C D E F# G#
+  Character:  Minor with raised 6th and 7th. Smooth, sophisticated.
+  Special:    Produces imMaj7, m6, and Lydian Dominant chords natively.
+
+1.8 LYDIAN DOMINANT
+  Pattern:    W W W H W H W
+  Notes (F):  F G A B C D Eb
+  Character:  Mixolydian with raised 4th. Floaty and unresolved simultaneously.
+  Relation:   Mode 4 of melodic minor.
+  Special:    The scale of the tritone substitution dominant chord.
+
+1.9 DIMINISHED (Octatonic, half-whole)
+  Pattern:    H W H W H W H W  (8 notes)
+  Notes (C):  C Db Eb E F# G A Bb
+  Character:  Maximally tense, symmetrical, ambiguous tonic.
+  Special:    Every note is equidistant; chord can resolve to multiple roots.
+              Used over dominant 7th chords for extreme tension.
+
+1.10 LOCRIAN
+  Pattern:    H W W H W W W
+  Notes (B):  B C D E F G A
+  Character:  Unstable, unresolved, no strong tonic.
+  Special:    Only useful as source of vii° chord or for Horror applications.
+              Not recommended as a home key except in Horror genre.
+
+1.11 DOUBLE HARMONIC (Byzantine / Arabic)
+  Pattern:    H A H W H A H
+  Notes (C):  C Db E F G Ab B
+  Character:  Two augmented 2nd intervals. Deeply exotic, tense, unsettling.
+  Special:    Produces tritone relationships and 6-semitone intervals.
+              Primary scale for Horror genre.
+
+1.12 HUNGARIAN MINOR (Double Harmonic Minor)
+  Pattern:    W H A H H A H
+  Notes (A):  A B C D# E F G#
+  Character:  Harmonic minor with raised 4th. Dark, mysterious, Eastern European.
+  Special:    Contains tritone (A→D#). Strong Horror and dramatic tension applications.
+
+1.13 TRITONE SCALE (Prometheus / Scriabin)
+  Pattern:    W W W H W H  (hexatonic, 6 notes)
+  Notes (C):  C D E F# A Bb
+  Character:  Built around the tritone interval. Ambiguous, unstable, cinematic.
+  Special:    No strong tonic. Tritone (C→F#) is the defining interval.
+              Useful in Horror for sustained unease rather than shock.
+
+
+═══════════════════════════════════════════════════════════════
+PART 2: CHORD CONSTRUCTION
+═══════════════════════════════════════════════════════════════
+
+2.1 THE ADD-SKIP RULE
+  Build chords by stacking every other note of the scale from the root:
+    3-note (triad):   root + 3rd + 5th
+    4-note (7th):     root + 3rd + 5th + 7th
+    4-note (no5):     root + 3rd + 7th       [drop 5th — standard jazz voicing]
+    4-note (6th):     root + 3rd + 5th + 6th [no 7th]
+    5-note (9th):     root + 3rd + 5th + 7th + 9th
+    4-note (9th/no5): root + 3rd + 7th + 9th [drop 5th — preferred 4-note 9th voicing]
+    5-note (6/9):     root + 3rd + 5th + 6th + 9th [no 7th]
+    4-note (6/9/no5): root + 3rd + 6th + 9th [drop 5th]
+
+2.2 CHORD TYPES BY INTERVAL STACK
+  Major triad:        M3 + m3         (4 + 3 semitones)
+  Minor triad:        m3 + M3         (3 + 4 semitones)
+  Diminished triad:   m3 + m3         (3 + 3 semitones)
+  Augmented triad:    M3 + M3         (4 + 4 semitones)
+  Major 7th (maj7):   M3 + m3 + M3
+  Minor 7th (m7):     m3 + M3 + m3
+  Dominant 7th (7):   M3 + m3 + m3    [the most tension-loaded standard chord]
+  Minor-Major 7th (mMaj7): m3 + M3 + M3  [eerie, from melodic/harmonic minor]
+  Half-diminished (m7b5): m3 + m3 + M3
+  Fully diminished (dim7): m3 + m3 + m3  [all equal, symmetrical]
+  Augmented 7th (aug7): M3 + M3 + m2  [from whole tone / exotic scales]
+
+2.3 THE 5TH IS OPTIONAL
+  The 5th of any chord can be dropped in 4-note voicings without changing
+  the chord's harmonic identity or function. This is standard practice.
+  Rule: if chord note count must be exactly 4, drop the 5th first.
+
+
+═══════════════════════════════════════════════════════════════
+PART 3: DIATONIC CHORD SETS
+═══════════════════════════════════════════════════════════════
+
+Chords listed as Roman numerals with 7th quality. Triad quality in brackets.
+
+3.1 MAJOR (in C)
+  I    Cmaj7   [major]
+  ii   Dm7     [minor]
+  iii  Em7     [minor]
+  IV   Fmaj7   [major]
+  V    G7      [major]       ← dominant 7th
+  vi   Am7     [minor]
+  vii° Bm7b5   [diminished]  ← half-diminished
+
+3.2 NATURAL MINOR (in A)
+  i    Am7     [minor]
+  ii°  Bm7b5   [diminished]
+  III  Cmaj7   [major]
+  iv   Dm7     [minor]
+  v    Em7     [minor]       ← no dominant function
+  VI   Fmaj7   [major]
+  VII  G7      [major]
+  V7*  E7      [major]       ← added chord: raise 3rd of v to get dominant (same as harmonic minor trick)
+
+3.3 DORIAN (in D)
+  i    Dm7     [minor]
+  ii   Em7     [minor]
+  III  Fmaj7   [major]
+  IV   G7      [major]       ← dominant color on IV is characteristic of Dorian
+  v    Am7     [minor]
+  vi°  Bm7b5   [diminished]
+  VII  Cmaj7   [major]
+
+3.4 MIXOLYDIAN (in G)
+  I    G7      [major]       ← tonic is itself a dominant 7th — defining feature
+  ii   Am7     [minor]
+  iii° Bm7b5   [diminished]
+  IV   Cmaj7   [major]
+  v    Dm7     [minor]
+  vi   Em7     [minor]
+  VII  Fmaj7   [major]
+
+3.5 LYDIAN (in F)
+  I    Fmaj7#11 [major]      ← raised 4th gives the #11 extension
+  II   G7       [major]      ← major chord on II is defining feature of Lydian
+  iii  Am7      [minor]
+  iv°  Bm7b5    [diminished]
+  V    Cmaj7    [major]      ← note: no dominant V7 in Lydian
+  vi   Dm7      [minor]
+  vii  Em7      [minor]
+
+3.6 HARMONIC MINOR (in A)
+  i    AmMaj7  [minor]       ← minor-major 7th, eerie quality
+  ii°  Bm7b5   [diminished]
+  III  Cmaj7#5 [augmented]
+  iv   Dm7     [minor]
+  V    E7      [major]       ← natural dominant 7th
+  VI   Fmaj7   [major]
+  vii° G#dim7  [fully dim]   ← fully diminished 7th
+
+3.7 MELODIC MINOR (in A)
+  i    AmMaj7  [minor]
+  ii   Bm7     [minor]
+  III  Cmaj7#5 [augmented]
+  IV   D7      [major]       ← Lydian dominant chord
+  V    E7      [major]
+  vi°  F#m7b5  [diminished]
+  vii° G#m7b5  [diminished]
+
+3.8 LYDIAN DOMINANT (in F, mode 4 of C melodic minor)
+  I    F7#11   [dominant]    ← defining chord of this scale
+  II   G7      [dominant]
+  iii° Am7b5   [diminished]
+  iv°  Bm7b5   [diminished]
+  V    Cmaj7   [major]
+  vi   Dm7     [minor]
+  vii  Em7     [minor]
+
+3.9 DIMINISHED (in C, half-whole)
+  Chords repeat every 3 semitones due to symmetry.
+  Primary chords: C7, Eb7, F#7, A7  (all dominant 7th, all interchangeable)
+  All can be treated as dominant functioning chords resolving to any of 4 roots.
+  Also produces: Cdim7, Ebdim7, F#dim7, Adim7
+
+3.10 DOUBLE HARMONIC (in C)
+  I    Cmaj7   [major]
+  bII  DbMaj7#5 [augmented]  ← flat 2nd, very tense
+  III  E7      [dominant]
+  IV   Fm7     [minor]
+  V    G7      [dominant]
+  bVI  AbMaj7  [major]
+  VII  Bdim7   [fully dim]
+  Note: tritone C→F# and augmented 2nds give this scale its Horror character.
+
+3.11 HUNGARIAN MINOR (in A)
+  i    AmMaj7  [minor]
+  ii°  Bm7b5   [diminished]
+  III  CMaj7#5 [augmented]
+  #iv° D#dim7  [fully dim]   ← raised 4th, tritone from root
+  V    E7      [dominant]
+  VI   FMaj7   [major]
+  vii° G#dim7  [fully dim]
+
+
+═══════════════════════════════════════════════════════════════
+PART 4: FUNCTIONAL HARMONY SYSTEM
+═══════════════════════════════════════════════════════════════
+
+4.1 THE THREE FAMILIES
+  TONIC (T):       Stable, resolved. Strong chords. Home base.
+  SUBDOMINANT (SD): Mild tension. Weak chords. Move away from home.
+  DOMINANT (D):    Strong tension. Weakest chords. Want to resolve to T.
+
+4.2 FUNCTION ASSIGNMENTS BY SCALE DEGREE
+
+  MAJOR KEY:
+    T:  I, iii, vi
+    SD: ii, IV, vii°
+    D:  V, vii°          (vii° can be SD or D depending on context)
+
+  NATURAL MINOR KEY:
+    T:  i, III
+    SD: ii°, iv, VI, VII, v
+    D:  V7 (added chord only — the raised dominant)
+
+  DORIAN:
+    T:  i, III
+    SD: ii, IV, VI
+    D:  V (weak dominant — Dorian has no natural leading tone)
+    Note: IV is a dominant 7th chord in Dorian but functions as SD here.
+
+  MIXOLYDIAN:
+    T:  I, vi
+    SD: ii°, IV, v
+    D:  No strong dominant (I itself is a dom7). VII acts as a weak D substitute.
+    Note: Progressions in Mixolydian often avoid strong resolution intentionally.
+
+  LYDIAN:
+    T:  I, V, iii
+    SD: II, vi, vii
+    D:  No dominant V7 — II7 (Lydian dominant) is the closest substitute.
+
+  HARMONIC MINOR:
+    T:  i, III
+    SD: ii°, iv, VI
+    D:  V7, vii° (fully diminished)
+
+  MELODIC MINOR:
+    T:  i, III
+    SD: ii, IV, vi°
+    D:  V7, vii°
+
+  LYDIAN DOMINANT:
+    T:  I (inherently unresolved — this scale lives in D function)
+    SD: II, vi
+    D:  I itself, iii°, iv°
+    Note: Lydian Dominant is most useful as a single-chord color or passing scale,
+          not as a home key for full progressions.
+
+  DIMINISHED:
+    All chords are D function. No stable tonic.
+    Use only for tension passages, transitions, or Horror.
+
+  DOUBLE HARMONIC / HUNGARIAN MINOR / TRITONE:
+    T:  I
+    SD: IV, bVI (Double Harmonic), VI (Hungarian)
+    D:  V7, bII (Double Harmonic — tritone sub), vii°, #iv° (Hungarian)
+    Note: bII as D function is the "Neapolitan" move — very effective in Horror.
+
+4.3 STRONG-WEAK RULE
+  Strong chords = Tonic family.
+  Weak chords = Subdominant + Dominant family.
+  Pattern: Strong → Weak → Weak → ... → Strong
+  Any sequence alternating strong and weak is harmonically valid.
+
+4.4 T–SD–D–T RULE
+  The most directional pattern.
+  Start on T, move to SD, move to D, resolve to T.
+  Can be extended: T → SD → D → T → SD → D → T ...
+  The cadence (D→T at the end) is the strongest moment of resolution.
+
+4.5 CADENCE TYPES (ending formulas)
+  Authentic:    V(7) → I     [strongest resolution]
+  Plagal:       IV → I       [softer, "amen" cadence]
+  Half:         any → V      [ends on tension, unresolved]
+  Deceptive:    V → vi       [surprise — resolves to relative minor instead]
+  Tritone sub:  bII7 → I     [jazz substitute for authentic cadence]
+  Phrygian:     bII → i      [used in Horror and flamenco]
+
+4.6 DOMINANT RULE
+  The V7 chord is the most tension-loaded standard chord.
+  In keys without a natural V7 (natural minor, Dorian, Mixolydian, Lydian):
+    → Raise the 3rd of the v chord by one semitone to create V7.
+    → This is always valid as a borrowed dominant.
+  In Horror scales, bII7 (Neapolitan dominant) can substitute or combine with V7.
+
+
+═══════════════════════════════════════════════════════════════
+PART 5: GENRE PROFILES
+═══════════════════════════════════════════════════════════════
+
+For each genre: preferred scales, preferred chord types, preferred patterns,
+cadence tendencies, and special rules.
+
+─────────────────────────────────────────────────────────────
+5.1 POP
+─────────────────────────────────────────────────────────────
+Scales:       Major (primary), Natural Minor, Dorian, Mixolydian, Lydian (occasional)
+Chord types:  Triads and 7th chords. 9th chords for color. Avoid exotic extensions.
+Pattern:      Strong-Weak strongly preferred. T–SD–D–T for emotional climax.
+Cadences:     Authentic (V→I) and Plagal (IV→I) most common. Deceptive for surprise.
+Length:       4-bar progressions most common. 8-bar for verse/chorus.
+Special rules:
+  - Start on I or vi (never on V or vii°).
+  - IV→I (plagal) is very idiomatic in pop choruses.
+  - Borrowed chords from parallel minor are common (e.g. bVII in major key).
+  - Avoid fully diminished chords and half-diminished in lead positions.
+  - 6/9 chords acceptable on I for a modern pop feel.
+
+─────────────────────────────────────────────────────────────
+5.2 NEO-SOUL
+─────────────────────────────────────────────────────────────
+Scales:       Dorian (primary), Major, Natural Minor, Melodic Minor, Mixolydian,
+              Lydian (color), Harmonic Minor (borrowed chords)
+Chord types:  9th chords (no5) preferred. maj7, m7, mMaj7, m6, 6/9 all standard.
+              Triads are too plain — always extend to at least 7th.
+Pattern:      T–SD–D–T for structured progressions.
+              Strong-Weak for vamps and loops (2–4 chords cycling).
+Cadences:     Deceptive cadences common. Tritone subs welcome.
+              Authentic cadence less common — resolution is often avoided or softened.
+Length:       2–4 chord vamps are idiomatic. 8-bar for song sections.
+Special rules:
+  - The ii–V–I (Dm7→G7→Cmaj7) and its extensions are central.
+  - Minor ii–V–i (Dm7b5→G7→Cm) equally important.
+  - m6 and mMaj7 chords signal sophistication — use freely on i chords.
+  - 6/9 on I or i gives the characteristic neo-soul openness.
+  - Chord substitutions (tritone, relative, parallel) are expected, not exceptional.
+  - Voicing matters: drop-2, spread voicings preferred over close position.
+
+─────────────────────────────────────────────────────────────
+5.3 JAZZ
+─────────────────────────────────────────────────────────────
+Scales:       All scales valid. Melodic Minor and its modes are essential.
+              Lydian Dominant, Diminished, Harmonic Minor used constantly.
+Chord types:  7th minimum. 9th, 11th, 13th standard. Altered chords (7#9, 7b9,
+              7#11, 7b13) over dominants. All chord types from all scales valid.
+Pattern:      ii–V–I is the fundamental unit (can replace T–SD–D–T).
+              Minor ii–V–i equally important.
+              Chain of ii–V's moving around the circle of 5ths is idiomatic.
+Cadences:     Tritone substitution standard (bII7→I replaces V7→I).
+              Deceptive, backdoor (bVII7→I), and Plagal all used.
+Length:       8-bar and 16-bar forms standard (based on song form: AABA, blues, etc.)
+Special rules:
+  - The dominant V7 chord can be altered: add b9, #9, b13, #11 freely.
+  - Diminished 7th chords resolve by moving any voice up a half step.
+  - Tritone substitution: replace any V7 with the dom7 chord a tritone away.
+  - Chord quality can be changed on any diatonic chord for color (modal interchange).
+  - Turnarounds (I→vi→ii→V or variations) are idiomatic at phrase endings.
+  - Reharmonization is expected — the same melody can support many chord choices.
+
+─────────────────────────────────────────────────────────────
+5.4 TRANCE
+─────────────────────────────────────────────────────────────
+Scales:       Natural Minor (primary), Major, Dorian, Harmonic Minor,
+              Mixolydian (euphoric sections)
+Chord types:  Triads common (power and open voicings for synth pads).
+              7th chords for color. Avoid complex extensions — clarity preferred.
+Pattern:      Strong-Weak strongly preferred for looping.
+              T–SD–D–T for builds and drops.
+Cadences:     Authentic (V→I or V→i) for drops.
+              Half cadence (ending on V) for sustained tension before drop.
+Length:       4-bar and 8-bar loops. Progressions repeat many times.
+Special rules:
+  - Progressions must work as loops — last chord must connect back to first.
+  - Minor i–VI–III–VII and i–VII–VI–VII are archetypal trance patterns.
+  - Harmonic minor's V7 is preferred over natural minor's v for drops.
+  - Pedal point (sustained root bass note under changing chords) is idiomatic.
+  - Avoid half-diminished and fully diminished in main progressions —
+    use only for brief tension moments in transitions.
+  - In major/euphoric sections: I–V–vi–IV is the defining pop-trance loop.
+
+─────────────────────────────────────────────────────────────
+5.5 HORROR
+─────────────────────────────────────────────────────────────
+Scales:       Double Harmonic (primary), Hungarian Minor, Harmonic Minor,
+              Diminished, Locrian, Tritone Scale
+Chord types:  Fully diminished 7th (dim7) — primary tension chord.
+              Half-diminished (m7b5), augmented triads, mMaj7.
+              Triads acceptable. Avoid maj7 and 9th chords (too warm/resolved).
+Pattern:      T–SD–D–T less important — ambiguity and avoidance of resolution preferred.
+              Chromatic voice leading (moving voices by half steps) over harmonic function.
+              Parallel motion (all voices move in same direction) for dread.
+Cadences:     Avoid authentic cadences — resolution breaks tension.
+              Phrygian cadence (bII→i) is primary.
+              Deceptive cadences useful for shock.
+              Half cadence (leave on V or vii°) for sustained unease.
+Length:       Variable — short 2-bar cells that repeat and mutate, or long slow movements.
+Special rules:
+  - The tritone interval (6 semitones) is the primary source of unease.
+    Build chords and progressions that emphasize tritone relationships.
+  - bII (Neapolitan chord) is extremely effective — a major chord a half step
+    above the tonic. Use bII→i as the primary cadential move.
+  - Fully diminished 7th chords are symmetrical — exploit this by resolving
+    them to unexpected roots (any of 4 possible resolutions).
+  - Augmented chords create unease through the absence of a stable 5th.
+  - Chromatic mediant relationships (chords whose roots are a 3rd apart with
+    no common key) create sudden tonal shifts — very effective for horror.
+  - Do not feel obligated to establish a tonic — floating tonality is valid.
+  - Cluster chords (semitone-adjacent notes) acceptable for extreme tension.
+  - The interval of a minor 2nd (half step) in a chord voicing creates maximum dissonance.
+
+
+═══════════════════════════════════════════════════════════════
+PART 6: PROGRESSION CONSTRUCTION ALGORITHM
+═══════════════════════════════════════════════════════════════
+
+INPUT:  scale, root, genre, length (number of chords)
+OUTPUT: sequence of chords with function labels
+
+STEP 1 — BUILD DIATONIC CHORD SET
+  Apply add-skip rule to the chosen scale from the chosen root.
+  Generate 4-note chords (drop 5th if needed for voice count).
+  Label each chord with its type and scale degree.
+
+STEP 2 — ASSIGN FUNCTIONS
+  Apply function table from Part 4.2 for the chosen scale.
+  Tag each chord as T, SD, or D.
+
+STEP 3 — SELECT PATTERN
+  Based on genre (Part 5):
+    Pop / Trance:    use Strong-Weak
+    Neo-soul / Jazz: use T–SD–D–T or ii–V–I chains
+    Horror:          use chromatic/Phrygian logic, avoid clean T–SD–D–T
+
+STEP 4 — PLACE FIRST CHORD
+  Always start on a T chord (I or i) except:
+    Horror: may start on any chord including D or ambiguous.
+    Jazz: may start on ii for an anacrusis into ii–V–I.
+
+STEP 5 — FILL MIDDLE CHORDS
+  Follow the chosen pattern.
+  Any chord within the correct functional family is valid at each position.
+  Prefer stepwise root motion (up or down a 2nd or 3rd) over leaps where possible.
+  Leaps of a 4th or 5th are also strong (circle of 5ths motion).
+
+STEP 6 — PLACE CADENCE
+  Apply cadence appropriate to genre (Part 4.5).
+  Last two chords should be D→T (authentic) or genre-appropriate substitute.
+  Exception: Trance loops — last chord must connect smoothly back to first.
+
+STEP 7 — VALIDATE LOOP (Trance only)
+  Check that final chord connects back to first chord via a valid T or SD function.
+  If not, adjust final chord or insert a bridge chord.
+
+STEP 8 — APPLY CHORD EXTENSIONS
+  Based on genre chord type preference (Part 5):
+    Pop:     upgrade triads to 7th chords where appropriate
+    Neo-soul: upgrade all chords to 7th minimum, prefer 9th and 6/9
+    Jazz:    apply extensions and alterations, especially on V chords
+    Trance:  keep triads or simple 7ths
+    Horror:  prefer dim7, m7b5, augmented; avoid maj7 and 9th
+
+
+═══════════════════════════════════════════════════════════════
+PART 7: SPECIAL TECHNIQUES (cross-genre)
+═══════════════════════════════════════════════════════════════
+
+7.1 MODAL INTERCHANGE (Borrowed Chords)
+  Borrow a chord from the parallel scale (same root, different mode).
+  Most common: borrow from parallel minor into major key.
+  Examples in C major: Fm (from C minor), Ab (from C minor), bVII (Bb).
+  Rule: borrowed chord retains its function from its source scale.
+
+7.2 TRITONE SUBSTITUTION
+  Replace any dominant V7 chord with the dom7 chord a tritone (6 semitones) away.
+  Example: G7 → Db7 (both resolve to C).
+  The two chords share the same tritone interval (different enharmonic spelling).
+  Applicable in: Jazz (standard), Neo-soul (common), Pop (occasional), Horror (natural).
+
+7.3 SECONDARY DOMINANTS
+  Apply a V7 chord to any diatonic chord, not just I.
+  Example: to approach Dm7 (ii in C), use A7 (V7 of ii) first.
+  Formula: find V7 of target chord, insert before target.
+  Applicable in: Jazz (essential), Neo-soul (common), Pop (occasional).
+
+7.4 CHROMATIC MEDIANT
+  Move between chords whose roots are a major or minor 3rd apart
+  and share no key relationship.
+  Example: C major → Ab major (roots a minor 3rd apart, no common key).
+  Creates sudden, colorful, non-functional shifts.
+  Applicable in: Horror (primary technique), Neo-soul (color), Jazz (reharmonization).
+
+7.5 PEDAL POINT
+  Sustain the root note in the bass while chords change above it.
+  Creates tension as non-tonic chords sound over the pedal.
+  Release pedal on resolution for maximum effect.
+  Applicable in: Trance (idiomatic), Horror (dread), Jazz (modal sections).
+
+7.6 NEAPOLITAN CHORD (bII)
+  A major chord built on the flat 2nd degree of the scale.
+  Example in A minor: Bb major.
+  Traditionally moves to V7 then i (bII→V7→i).
+  In Horror, bII→i directly (Phrygian cadence) is primary.
+  Applicable in: Horror (essential), Jazz (reharmonization), Neo-soul (color).
+
+
+═══════════════════════════════════════════════════════════════
+PART 8: QUICK REFERENCE — GENRE × SCALE COMPATIBILITY
+═══════════════════════════════════════════════════════════════
+
+★★★ = primary   ★★ = common   ★ = occasional   — = avoid
+
+Scale                | Pop | Neo-soul | Jazz | Trance | Horror
+---------------------|-----|----------|------|--------|-------
+Major                | ★★★ | ★★★      | ★★★  | ★★★    | —
+Natural Minor        | ★★★ | ★★★      | ★★   | ★★★    | ★
+Dorian               | ★★  | ★★★      | ★★★  | ★★     | —
+Mixolydian           | ★★  | ★★★      | ★★★  | ★★     | —
+Lydian               | ★★  | ★★       | ★★★  | ★★     | —
+Harmonic Minor       | ★★  | ★★       | ★★★  | ★★★    | ★★
+Melodic Minor        | ★   | ★★★      | ★★★  | ★      | ★
+Lydian Dominant      | ★   | ★★       | ★★★  | ★      | ★
+Diminished           | ★   | ★        | ★★★  | ★★     | ★★★
+Locrian              | —   | —        | ★    | —      | ★★
+Double Harmonic      | —   | ★        | ★    | —      | ★★★
+Hungarian Minor      | —   | ★        | ★★   | —      | ★★★
+Tritone Scale        | —   | —        | ★★   | —      | ★★★
+
+
+═══════════════════════════════════════════════════════════════
+END OF DOCUMENT
+Version 1.0
+═══════════════════════════════════════════════════════════════

@@ -1,0 +1,438 @@
+# Modular Synthesizer Knowledge Base
+
+This file provides foundational knowledge about modular synthesizer concepts, signal types, and module behavior to inform AI-assisted development work on Eurorack modules, Disting NT algorithms, and related audio DSP projects.
+
+---
+
+## 1. Signal Types in Eurorack
+
+All signals in a Eurorack system are analog voltages. The same physical jack and cable type is used for everything — the distinction between signal types is purely conceptual and contextual.
+
+### Audio Signals
+- Oscillate in the audible frequency range (roughly 20 Hz – 20 kHz)
+- Typically ±5V peak-to-peak (10 Vpp)
+- The Eurorack power supply provides ±12V rails; no signal should exceed this range
+- Audio signals can be used as CV (for FM, AM, etc.) — the distinction is about frequency and intent, not voltage format
+
+### CV (Control Voltage)
+- A continuous analog voltage used to control a parameter on another module
+- Unipolar CV: typically 0–10V or 0–8V (e.g., envelope outputs)
+- Bipolar CV: typically ±5V (e.g., LFO outputs, modulation sources)
+- Common CV targets: oscillator pitch, filter cutoff, VCA gain, panning, effect parameters
+
+### Pitch CV (1V/oct)
+- The standard for pitch control in Eurorack (established by Bob Moog)
+- Each 1V increase raises pitch by exactly one octave
+- The 12 semitones of an octave are linearly distributed within 1V (1 semitone = ~83.3 mV)
+- Example: 0V = some base pitch (often C), 1V = one octave up, 2V = two octaves up
+- Most oscillators follow this standard; always check — older Korg/Yamaha gear uses Hz/V, which is incompatible without conversion
+- VCV Rack standard: C4 (middle C, 261.6 Hz) at 0V
+
+### Gate Signals
+- A high/low voltage that remains high for the duration of a note
+- "High" is typically +5V or higher (Eurorack standard treats anything above ~1V as high)
+- Goes high when a key is pressed (or a sequencer step is active), goes low when released
+- Used to trigger envelope generators and indicate note duration
+- A gate held high keeps an envelope in its sustain phase
+
+### Trigger Signals
+- A brief pulse, typically only a few milliseconds long
+- Unlike a gate, it doesn't carry duration information — just "now"
+- Used to: retrigger envelopes, reset sequencers/LFOs, fire one-shot events, clock sequencers
+- Retriggering an envelope mid-note snaps it back to the attack phase, creating percussive effects
+
+### Clock Signals
+- A regular stream of triggers or gates at a defined tempo (BPM)
+- Square wave oscillating at sub-audio rates
+- Dividers and multipliers can derive different rhythmic subdivisions from a master clock
+
+### S-Trig (Short-Circuit Trigger)
+- Legacy format used in early Moog modular systems
+- Normally held high; shorts to ground to trigger
+- Incompatible with modern V-trig without conversion
+
+---
+
+## 2. The Basic Synthesizer Signal Chain
+
+The classic "East Coast" (Moog-style) subtractive synthesis voice:
+
+```
+[VCO] → [VCF] → [VCA] → [output]
+          ↑        ↑
+       [EG2]    [EG1]
+          ↑        ↑
+       [Gate] ← [Gate]
+       
+[Sequencer/Keyboard] → Pitch CV → [VCO]
+[Sequencer/Keyboard] → Gate → [EG1, EG2]
+```
+
+- **VCO**: generates the raw waveform at the pitch defined by incoming CV
+- **VCF**: shapes timbre by filtering harmonics
+- **VCA**: controls amplitude — keeps the oscillator from droning continuously
+- **EG (envelope generator)**: shapes how VCF and VCA change over time in response to a gate
+- **Sequencer / keyboard**: provides pitch CV and gate signals
+
+**West Coast (Buchla-style)** synthesis uses a different philosophy: complex oscillators (often using FM or waveshaping) fed through a Low Pass Gate (LPG), which combines VCA and filter behavior in a single element controlled by a vactrol. Shorter, punchier, more percussive and harmonically rich — less reliance on filtering, more on oscillator complexity.
+
+---
+
+## 3. VCO — Voltage Controlled Oscillator
+
+The primary sound source. Oscillators run continuously (they never stop) — the VCA is what creates silence between notes.
+
+### Waveform Types
+- **Sine**: smooth, no harmonics beyond the fundamental. Soft, pure tone.
+- **Triangle**: only odd harmonics, attenuating quickly. Sonically similar to sine but slightly brighter.
+- **Sawtooth (ramp)**: contains all harmonics (odd and even). Bright and buzzy — the classic subtractive synthesis source.
+- **Square / pulse**: only odd harmonics. Hollow, "woodwind"-like sound. Pulse width determines timbre (PWM = pulse width modulation, a common dynamic effect).
+- **Noise**: all frequencies simultaneously. Used for percussion, wind, and random modulation sources.
+
+### VCO Inputs
+- **1V/oct CV**: sets pitch
+- **FM (linear or exponential)**: modulates frequency — audio-rate FM creates sidebands and complex timbres; LFO-rate FM creates vibrato
+- **Sync**: hard sync resets the waveform cycle to the phase of an incoming signal, creating aggressive harmonic effects
+
+### Oscillator Modes
+- **Audio-rate VCO**: primary sound source, typically 20 Hz – 20 kHz range
+- **LFO (Low Frequency Oscillator)**: same circuit, but running below audio rate (~0.01 Hz – 20 Hz). Used as a modulation source, not heard directly.
+  - LFO → VCO pitch = vibrato
+  - LFO → VCF cutoff = filter wobble / wah
+  - LFO → VCA = tremolo (amplitude modulation)
+  - LFO → PWM = pulse width animation
+
+---
+
+## 4. VCF — Voltage Controlled Filter
+
+Shapes the timbre of the sound by attenuating certain frequency ranges.
+
+### Filter Types
+- **Low-pass filter (LPF)**: passes frequencies below the cutoff, attenuates above. Most common in subtractive synthesis. The "cutoff sweep" sound.
+- **High-pass filter (HPF)**: passes frequencies above the cutoff, attenuates below. Thins out the sound.
+- **Band-pass filter (BPF)**: passes a band of frequencies around the cutoff. Nasal, focused sound.
+- **Notch (band-reject)**: attenuates a narrow band, passes everything else.
+- **State variable / multimode**: offers multiple outputs simultaneously.
+
+### Key Parameters
+- **Cutoff frequency**: the frequency at which the filter begins to attenuate. CV-controllable.
+- **Resonance (Q)**: emphasizes frequencies near the cutoff, creating a ringing peak. At high resonance, many filters self-oscillate — producing a sine wave even with no audio input.
+- **Filter slope**: measured in dB per octave (12 dB = 2-pole, 24 dB = 4-pole). Steeper = more dramatic effect.
+- **Key tracking**: a portion of the pitch CV is also routed to the filter cutoff, keeping the filter in a musically related ratio to the note being played. 100% tracking = filter cutoff moves exactly one octave per octave of pitch.
+
+### Filter in the Synthesis Chain
+The filter envelope (typically a second EG) sweeps the cutoff frequency over time, simulating how acoustic instruments are often brightest at the attack transient and then soften. Classic: fast attack, medium decay, zero sustain on the filter EG = percussive "pluck" shape.
+
+---
+
+## 5. VCA — Voltage Controlled Amplifier
+
+Controls the amplitude of a signal based on an incoming CV. The VCA is the element that translates an envelope into dynamics — without it, the oscillator drones forever.
+
+### Core Concept
+- Has two inputs: **signal in** (audio or CV to be scaled) and **CV in** (controls the gain)
+- Output amplitude = signal amplitude × CV level (roughly)
+- At 0V CV: silence (or minimum output)
+- At max CV: full signal passes through
+- VCAs do NOT need to be in the audio path — they can scale any CV signal
+
+### Linear vs. Exponential Response VCAs
+- **Linear VCA**: gain scales linearly with CV. Equal CV steps = equal amplitude steps. Mathematically correct, but sounds like amplitude fades very quickly and then is mostly at full volume — not perceptually even.
+- **Exponential VCA**: gain scales exponentially with CV. Matches human hearing (which perceives loudness logarithmically). Equal CV steps = equal perceived volume steps. Sounds more natural for musical amplitude control.
+- When pairing: exponential-shaped envelope + linear VCA ≈ linear-shaped envelope + exponential VCA in terms of perceived result. Mixing these produces different characters.
+
+### Extended Uses of VCAs
+- **Modulation depth control**: a VCA between an LFO and its destination controls how much modulation is applied. An envelope opens the VCA → modulation fades in/out over the note.
+- **Amplitude modulation (AM)**: patching an audio-rate oscillator to the CV input of a VCA whose signal input carries another oscillator = ring modulation / AM synthesis, creating sidebands.
+- **Velocity simulation**: a VCA in the CV path (before the main audio VCA) scales the envelope amplitude based on a velocity signal.
+- **Dynamic effects routing**: control reverb send level, delay feedback, or any other parameter dynamically.
+
+> "You can never have enough VCAs." — universal modular wisdom
+
+---
+
+## 6. Envelope Generators (EG / ADSR)
+
+An envelope generator produces a shaped CV trajectory in response to a gate signal. It defines how a parameter changes over time during a note.
+
+### Why Envelopes Exist
+All sounds — acoustic or synthetic — have envelopes. A piano note rises quickly, decays slightly, sustains while the key is held, then fades when released. A snare drum attacks instantly and decays to nothing. The envelope generator lets you sculpt this behavior for a synthesized sound. When connected to a VCA, it creates dynamics; when connected to a VCF, it shapes timbre over time.
+
+### ADSR — The Four Segments
+
+```
+         /\
+        /  \
+       /    \_________ (sustain level)
+      /                \
+-----                   -----
+  A     D      S          R
+```
+
+1. **Attack**: Time from gate-on to peak level. Short attack = sharp, percussive onset. Long attack = slow swell from silence.
+2. **Decay**: Time from peak to sustain level. Controls how quickly the initial transient fades to the held level.
+3. **Sustain**: The level held while the gate remains high. This is a **level** (voltage), not a time. Can be 0 (fully percussive) to maximum.
+4. **Release**: Time from gate-off to zero. Short release = abrupt cutoff. Long release = gradual fade / reverb-like tail.
+
+### Triggering Behavior
+- Gate goes high → attack begins
+- Attack reaches peak → decay begins immediately
+- Decay reaches sustain level → sustain held as long as gate is high
+- Gate goes low → release begins (from wherever the envelope currently is)
+- **Early gate-off**: behavior varies by module. Many modules jump immediately to release from wherever attack/decay has reached. Some always complete the attack first. Check module documentation.
+- **Retrigger**: if a new gate/trigger arrives before the previous envelope has finished, the envelope resets to attack from its current level (not from zero) — this can cause the "clicking" of retriggered transients.
+
+### Envelope Curve Shapes
+
+The curve shape of each segment profoundly affects the character:
+
+- **Exponential curves** (most common in analog): the rate of change slows as the target is approached. Attack is concave-down (quick rise, then eases in); decay/release are concave-up (fast initial fall, then eases out). Natural-sounding because it mirrors RC circuits (capacitor + resistor) and also mirrors how human hearing perceives level changes.
+- **Linear curves**: constant rate of change throughout the segment. Sounds more mechanical and "electronic." Often perceived as slower-sounding than exponential even at the same time setting.
+- **Logarithmic/reverse-exponential**: fast at the end of the segment rather than the start. Less common, can be used for special effects.
+
+> Exponential envelope + linear VCA ≈ linear envelope + exponential VCA (in perceived result). The combination matters, not just one component.
+
+> Perceptual note: ultra-fast attacks often *sound* slower than moderately fast attacks due to auditory illusions. Don't chase "maximum snappiness" by making attacks ever shorter — a slightly non-zero attack often sounds crisper.
+
+### Beyond ADSR
+
+- **AD (Attack-Decay)**: no sustain, no release. Fires and returns to zero. Triggered by a trigger (not gate duration). Good for percussion.
+- **AR (Attack-Release)**: like a gate-following ramp. Simple and useful.
+- **ASR (Attack-Sustain-Release)**: no decay phase. Everything sounds organ-like.
+- **Multi-stage / function generators**: arbitrary segment counts and shapes. Example: Befaco Rampage, Maths — can loop, act as LFOs, slew limiters, comparators.
+- **Looping envelopes**: when the envelope is set to loop (re-trigger itself at the end of release), it becomes an LFO with a shaped waveform.
+
+### Envelope as a General-Purpose CV
+
+An envelope is just a CV with a particular time shape. It can be used to modulate anything:
+- VCF cutoff: filter sweep per note
+- Oscillator pitch: pitch drop/rise at note start (important for kick drums — fast pitch decay)
+- Delay time, reverb amount, wavefolder depth, panning...
+
+---
+
+## 7. Sequencers
+
+A sequencer generates sequences of CV and/or gate/trigger signals, automating pitch and rhythm over time.
+
+### Types
+
+- **Step sequencer**: a fixed number of steps (commonly 8, 16, 32), each with a pitch CV value and optionally a gate on/off. Steps advance on each incoming clock pulse.
+- **Gate/trigger sequencer**: generates only rhythmic patterns (on/off per step), not pitch. Used for percussion patterns.
+- **CV sequencer**: generates only pitch/modulation CV, no gates (paired with a separate gate sequencer).
+- **Euclidean sequencer**: distributes a set number of triggers evenly across a number of steps using the Euclidean algorithm. Creates rhythmically interesting patterns (e.g., 3 hits in 8 steps = [1,0,0,1,0,0,1,0]).
+- **Random / generative**: uses probability, random voltages (S&H), or algorithmic rules to generate evolving sequences.
+
+### Key Concepts
+
+- **Clock input**: each clock pulse advances the sequencer one step. Clock rate = tempo. Clock division (÷2, ÷4) = slower sequence; multiplication (×2) = faster.
+- **Reset**: a trigger input that forces the sequencer back to step 1, allowing synchronization.
+- **Gate length**: the proportion of each step that the gate is held high. Affects perceived articulation (legato vs. staccato).
+- **Quantization**: rounding pitch CV to the nearest semitone (or scale degree). A quantizer module takes arbitrary CV and snaps it to musical pitches. Can be configured for specific scales/modes.
+- **Transpose**: shifting all CV steps up or down by a fixed voltage — typically done by adding a CV offset to the sequencer output.
+
+---
+
+## 8. LFOs — Low Frequency Oscillators
+
+An LFO is simply a VCO running below the audio range, used as a modulation source rather than a sound source. The conceptual distinction is frequency and intent — the circuits are often identical or similar.
+
+### Typical Rate Range
+- 0.01 Hz (very slow, ~100 second cycle) to ~20 Hz (boundary of audio range)
+- Some LFOs can run into audio rate (becoming oscillators usable for FM/AM)
+
+### Waveforms and Their Uses
+- **Sine**: smooth, natural-feeling periodic modulation (vibrato, tremolo)
+- **Triangle**: like sine but with linear edges; slightly sharper feel
+- **Square**: abrupt transitions — useful for trills, alternating between two states
+- **Sawtooth / Ramp**: gradual rise, sudden fall (or reverse). Good for filter "breathing," stepped effects
+- **Sample & Hold (S&H)**: random stepped voltages, updated on a trigger. Classic "computer" sound. Often generated by clocking an S&H with an LFO and feeding it white noise.
+
+### LFO Sync
+LFOs can be synced to a master clock, locking their rate to a musical division (1 bar, 1/4 note, etc.). This keeps modulation rhythmically related to the sequence tempo.
+
+---
+
+## 9. Utilities: The Glue of a Modular System
+
+### Attenuator
+Scales a signal down (multiplies by a value 0–1). Simple but essential for controlling modulation depth.
+
+### Attenuverter
+Scales a signal from -1 to +1, allowing polarity inversion as well as attenuation. A negative value flips the CV direction (e.g., a rising envelope causes the filter to close rather than open).
+
+### Offset / Voltage Source
+Adds a fixed DC voltage to a signal, or provides a manual CV source. Used to transpose sequences, bias VCA levels, shift filter cutoff.
+
+### Mixer (CV or Audio)
+Sums multiple signals. In the CV domain, mixing two LFOs creates a more complex modulation shape. In audio, mixing multiple oscillators creates richer timbres.
+
+### Multiple / Buffered Multiple
+Splits one signal to multiple destinations. An unbuffered (passive) multiple shares voltage directly — acceptable for audio but may cause pitch drift when sharing 1V/oct CV among multiple oscillators. A buffered multiple uses op-amps to drive each output independently, preserving voltage accuracy.
+
+### Sample & Hold (S&H)
+On a trigger, "samples" the current value of an input and holds it until the next trigger. Classic use: noise into S&H triggered by a clock = random stepped CV (quantized to pitch = random melody).
+
+### Slew Limiter / Lag Processor
+Smooths sudden voltage transitions, adding glide/portamento. Can turn a stepped sequence into a smooth glide. Also acts as a basic function generator (attack = slew up rate, decay = slew down rate). Filters are essentially slew limiters with resonance.
+
+### Logic Modules (AND, OR, XOR)
+Combine gate signals. AND = gate only if both inputs are high. OR = gate if either is high. XOR = gate if exactly one is high. Powerful for creating complex rhythmic interactions.
+
+### Clock Divider / Multiplier
+Derives slower or faster clock signals from a master clock. ÷2 = half tempo, ÷4 = quarter tempo. Essential for polyrhythm and structured rhythmic relationships.
+
+### Quantizer
+Rounds incoming CV to the nearest note of a defined scale/tuning. Can be configured for specific modes, microtonal scales, or custom mappings. Key for turning generative or random CV into musical pitches.
+
+---
+
+## 10. Signal Level Reference (Eurorack)
+
+| Signal Type      | Typical Range    | Notes                                      |
+|------------------|------------------|--------------------------------------------|
+| Audio            | ±5V (10 Vpp)    | May clip at ±12V rail; some distortion is musical |
+| Unipolar CV      | 0 – 10V          | Envelopes, modulation depths               |
+| Bipolar CV       | ±5V              | LFOs, attenuverter outputs                 |
+| Pitch CV (1V/oct)| 0 – 8V typical  | Covers ~8 octaves; some modules go negative |
+| Gate / Trigger   | 0V low, +5V high| Anything >~1V usually registers as "high"  |
+| Power rails      | ±12V, +5V        | +5V rail optional/unused on many modules   |
+
+---
+
+## 11. Patching Philosophy
+
+- **Everything is a voltage**: audio, CV, gates, triggers — they are all voltages. Any output can technically go to any input. Unexpected connections are a primary creative tool.
+- **Signal flow direction**: outputs → inputs. Never connect two outputs together without a mixer (may damage modules).
+- **Normalization**: some modules have "normalled" connections — a default internal connection that is overridden when a cable is plugged in. Common in mixers and semi-modular instruments.
+- **Multiple instances**: the reason "you can never have enough VCAs" is that VCAs are not just for audio amplitude — they are the primary tool for dynamically controlling anything with anything else. Same for attenuators, mixers, and envelope generators.
+- **Self-patching**: feeding a module's output back to its own input. Common for oscillator FM (self-FM = wavefolding-like effects), envelope feedback, etc.
+
+---
+
+## 12. AHD Envelopes
+
+AHD stands for **Attack, Hold, Decay** — a three-stage envelope that omits sustain and release entirely. It is a one-shot (trigger-based) shape that always runs to completion regardless of gate length.
+
+```
+         /‾‾‾‾‾\
+        /        \
+       /          \
+------              ------
+   A      H      D
+```
+
+1. **Attack**: rises from zero to peak (same as ADSR attack)
+2. **Hold**: stays at peak level for a defined time before beginning to fall. This is the key distinction from AD envelopes — the hold segment maintains the peak, which is critical for certain sounds where you want a moment of full amplitude before the decay begins.
+3. **Decay**: falls from peak to zero. No sustain, no release — the envelope is fully determined by the trigger, not the gate length.
+
+### AHD vs. AD
+- An AD envelope goes immediately from peak into decay. There is no dwell time at the top.
+- AHD inserts a flat hold period at the peak — useful when you want an audible transient "top" before the tail.
+- Both are fundamentally one-shot: they fire completely from a trigger, making them ideal for percussion and other non-sustained sounds.
+
+### AHD vs. ADSR
+- ADSR is gate-length dependent (sustain continues as long as gate is high)
+- AHD always runs the same shape regardless of gate length
+- AHD cannot produce sustained notes; ADSR can
+- For drum synthesis and percussive patches, AHD is often preferred because it gives predictable, consistent hit shapes
+
+### Typical Uses
+- **Kick drum pitch envelope**: fast attack, zero hold, fast exponential decay drives the pitch down from a high frequency — the classic "thump" of an electronic kick
+- **Snare body/noise**: short attack, zero hold, medium decay controls the amplitude of the noise burst
+- **Any percussive hit**: where you want the envelope to be self-contained and not affected by how long the sequencer gate is held open
+- **Modulation**: AHD as a CV source for filter cutoff, wavefolder, or other parameters on percussion hits
+
+### Hold as a Musical Parameter
+The hold segment is underrated. In drum synthesis:
+- Short hold + long decay = natural, rounded hit
+- Long hold = sustained "gate open" body before the tail (useful for industrial/synthetic sounds, or simulating a held pad hit)
+- Zero hold = same as AD envelope
+
+Some modules label this differently: "sustain" on a percussive envelope module may actually function as a hold (a timed flat top), not as a level-based sustain as in ADSR.
+
+---
+
+## 13. Drum Synthesis
+
+Electronic drum sounds are synthesized by combining a small number of fundamental building blocks — oscillators, noise, envelopes, filters, and VCAs — in specific ways. Understanding these recipes is essential for designing drum-related modules and algorithms.
+
+### Kick Drum
+
+The classic electronic kick (as in TR-808 style) is built from:
+
+1. **Sine or triangle oscillator**: the body of the kick. No harmonics needed — the low-frequency fundamental is the sound.
+2. **Pitch envelope (AHD or AD)**: a fast-decay envelope sweeps the oscillator frequency from a high starting pitch (often 150–400 Hz) down to a low resting pitch (40–80 Hz). The speed and curve of this sweep defines the character ("click" transient vs. smooth "thud").
+3. **Amplitude envelope (AHD or AD)**: controls the overall volume shape. Typically a fast attack and a longer exponential decay (200–800 ms).
+4. **Optional: VCF on the body**: a low-pass filter can roll off the top end of the body oscillator to tune the "thickness."
+
+Key parameters:
+- **Pitch start / pitch end**: define the sweep range
+- **Pitch decay time**: fast = punchy click; slow = longer tonal "note"
+- **Amplitude decay time**: short = tight; long = boomy
+- **Body tuning**: the resting pitch of the oscillator
+
+Exponential pitch decay is critical — linear sweeps sound unnatural. The ear perceives pitch logarithmically, so an exponential curve in the pitch CV produces a perceptually even sweep.
+
+### Snare Drum
+
+A snare is typically two layers mixed together:
+
+1. **Tone body**: one or two sine/triangle oscillators at relatively low frequencies (~180–250 Hz). Short AHD envelope — this is the "thwack."
+2. **Noise burst**: white or pink noise through a VCA with a short-to-medium AHD envelope. This is the "snare rattle." A high-pass or band-pass filter shapes the noise character.
+3. **Mix of both**: the ratio of tone to noise determines whether the snare sounds more "acoustic" (more tone) or "electronic" (more noise).
+
+Optional: a pitch envelope on the tone oscillator (like a mini kick pitch sweep) adds snap to the attack.
+
+### Hi-Hat
+
+Hi-hats are almost entirely noise — specifically filtered noise:
+
+1. **White noise** (or a mix of high-frequency square waves — the original TR-808 technique uses 6 detuned square oscillators)
+2. **High-pass or band-pass filter**: removes the low end, leaving only the bright "shhh" character
+3. **VCA with envelope**:
+   - **Closed hi-hat**: very short AD envelope (a few milliseconds to ~100 ms decay)
+   - **Open hi-hat**: same attack, much longer decay (~300 ms – 1 s)
+   - Open and closed are often the same circuit with two different decay times, and the closed hat is triggered to cut off the open hat's tail
+
+### Clap
+
+Electronic claps simulate the layered, slightly smeared sound of multiple hands:
+
+1. **Noise burst through VCA**: multiple very short noise bursts in rapid succession (simulating separate hand slaps), followed by a longer noise tail (the "reverb" of the room)
+2. **Band-pass filter**: shapes the noise into the characteristic "snap" frequency range (~1–3 kHz)
+3. Alternatively: a noise burst with an amplitude envelope that has a fast attack and a "bumpy" decay (some modules simulate this with multiple re-triggers in quick succession)
+
+### Tom / Low Percussion
+
+Similar to kick but at a higher pitch range:
+
+1. **Sine or triangle oscillator** at a higher base frequency (~80–200 Hz)
+2. **Pitch envelope**: smaller, faster sweep than a kick
+3. **Amplitude envelope**: medium decay
+
+### 808-Style Bass (pitched kick / bass)
+
+When the kick's pitch decay is slowed and the resting pitch is raised into a musical range, the kick becomes a pitched bass tone — the classic "808 bass." The pitch can then be controlled via 1V/oct CV, allowing it to be sequenced musically. The VCA decay determines the note length.
+
+### General Drum Synthesis Principles
+
+- **Pitch envelopes are everything**: the character of a percussive sound is defined more by its pitch trajectory than by its waveform. Even a simple sine oscillator becomes a convincing drum with the right pitch envelope.
+- **Exponential decays sound natural**: both amplitude and pitch decays should be exponential (not linear) to match acoustic behavior and human perception.
+- **Short is tight, long is loose**: amplitude decay time is the primary control over the "feel" of a hit in a mix.
+- **Noise character**: white noise has equal energy per frequency; pink noise has more low-end energy (sounds "warmer"). The filter on a noise source dramatically changes the character.
+- **Layering**: most convincing drum sounds use at least two layers (e.g., tone + noise for snare, or click + body for kick). The mix ratio shapes the character.
+- **Waveshaping / saturation on kick**: driving the kick oscillator slightly into saturation (clipping or soft folding) adds harmonics and presence, making it cut through a mix better.
+
+---
+
+## Sources
+
+- Intellijel Eurorack 101: https://intellijel.com/support/eurorack-101/
+- Doepfer A-100 Technical Details: https://doepfer.de/a100_man/a100t_e.htm
+- North Coast Synthesis Modular Intro (13-part series): https://northcoastsynthesis.com/news/
+- Noise Engineering Getting Started series: https://noiseengineering.us/blogs/loquelic-literitas-the-blog/
+- Perfect Circuit Learning Synthesis series: https://www.perfectcircuit.com/signal/
+- Sound On Sound "Synth Secrets" series: https://www.soundonsound.com/techniques/
+- VCV Rack Voltage Standards: https://vcvrack.com/manual/VoltageStandards
