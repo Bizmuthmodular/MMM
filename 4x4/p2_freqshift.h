@@ -16,15 +16,14 @@
 // (4x4-System-Overview.md §2/§9): a frequency shifter benefits from the
 // same "every render sounds like a different instrument" character pitch
 // shift gets, rather than starting silent/neutral like P4's curve-only
-// controls. Unit: Hz, bipolar. Range: ±2000Hz for the combined
-// base+depth total — a deliberately wide, dramatic range (true frequency
-// shifting turns harmonic content inharmonic within a few tens of Hz, so
-// even this is already extreme over most of its range), chosen to be
-// comparably "wide but bounded" to P1's ±24 semitones, and to stay
-// comfortably inside the allpass design's verified <1-degree-accurate
-// range (~16Hz-23.5kHz per Step 6) — the SHIFT amount, not the input
-// frequency, is what's bounded here, so ±2000Hz never asks the Hilbert
-// approximation itself to operate outside its validated range.
+// controls. Unit: Hz, bipolar. Range: ±10000Hz for the combined
+// base+depth total (EXTENDED 2026-10-25 from ±2000 per user request) — a
+// deliberately wide, dramatic range (true frequency shifting turns harmonic
+// content inharmonic within a few tens of Hz, so this is extreme over most
+// of its range). The SHIFT amount, not the input frequency, is what's
+// bounded here; the allpass Hilbert approximation itself still only ever
+// processes the real input signal, so the wider shift range does not push
+// the approximation outside its validated band.
 //
 // No dynamic allocation, no STL, no exceptions/RTTI, C++11.
 #pragma once
@@ -105,7 +104,7 @@ public:
     void onNewRender( uint32_t seed, int renderIndex )
     {
         float r = randomBaseFn ? randomBaseFn( seed, renderIndex ) : 0.5f;
-        baseHz_ = ( r * 2.0f - 1.0f ) * 2000.0f;
+        baseHz_ = ( r * 2.0f - 1.0f ) * 10000.0f;   // +-10000Hz (extended 2026-10-25, was +-2000)
         phase_ = 0.0f;
     }
 
@@ -114,8 +113,8 @@ public:
     float processSample( float x, float depthHz, float sampleRate )
     {
         float shiftHz = baseHz_ + depthHz;
-        if ( shiftHz > 2000.0f ) shiftHz = 2000.0f;
-        if ( shiftHz < -2000.0f ) shiftHz = -2000.0f;
+        if ( shiftHz > 10000.0f ) shiftHz = 10000.0f;
+        if ( shiftHz < -10000.0f ) shiftHz = -10000.0f;
 
         float aOut = a0.process( x );
         aOut = a1.process( aOut );

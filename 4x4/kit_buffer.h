@@ -43,7 +43,7 @@
 namespace kitbuffer {
 
 static const int kSampleRateHz = 32000;          // locked, §8
-static const int kNumSamples = 141000;            // even; trimmed for DRAM margin (see above)
+static const int kNumSamples = 135000;            // even; trimmed 141000->135000 on 2026-10-24 to free ~18KB DRAM for the spectral slice looper's per-slice map (4.40625s -> 4.21875s)
 static const int kBytesPerBuffer = kNumSamples / 2 * 3;   // 211,500 bytes
 static const float kDurationSec = (float)kNumSamples / (float)kSampleRateHz;   // 4.40625s
 

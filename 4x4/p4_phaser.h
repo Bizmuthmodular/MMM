@@ -30,6 +30,16 @@
 // offset and the sample rate (the coefficient depends on fs, which changes
 // with oversampling, §7).
 //
+// DUAL-PHASER DETUNE (2026-10-25 user request): a SECOND independent 12-stage
+// allpass chain runs in parallel, tuned to fc * detuneRatio_, and the two wet
+// paths are blended equally. detuneRatio_ is a random value drawn ONCE PER
+// RENDER (NOT a GUI parameter, and deliberately NOT a Contour destination -- it
+// is not modulated); it offsets the second chain's comb from the first so the
+// phaser gets the wider, thicker, interleaved-notch character of a dual phaser.
+// With detune==1 the blend collapses exactly to the old single-chain output
+// (out = 0.5*(dry+wet)), so the level is unchanged. Both chains sweep together
+// with the Contour, kept a fixed ratio apart.
+//
 // No dynamic allocation, no STL, no exceptions/RTTI, C++11.
 #pragma once
 #include <cmath>
@@ -41,6 +51,7 @@ static const int   kStages      = 12;
 static const float kPi          = 3.14159265358979323846f;
 static const float kBaseFreqMin = 300.0f;    // randomized base center range (Hz)
 static const float kBaseFreqMax = 1800.0f;
+static const float kDetuneOct   = 0.5f;      // per-render detune spread: +-0.5 octave (ratio ~0.707..1.414)
 static const float kFreqFloor   = 40.0f;     // absolute clamp for fc after the offset
 static const float kFreqCeil    = 8000.0f;   // (also kept below 0.45*fs at runtime)
 
@@ -60,55 +71,87 @@ public:
 
     void reset()
     {
-        for ( int i = 0; i < kStages; ++i ) { apX1_[i] = 0.0f; apY1_[i] = 0.0f; }
+        for ( int i = 0; i < kStages; ++i )
+        {
+            apX1_[i] = 0.0f; apY1_[i] = 0.0f;
+            apX1b_[i] = 0.0f; apY1b_[i] = 0.0f;
+        }
         baseFreq_    = 600.0f;   // sensible default until onNewRender draws one
+        detuneRatio_ = 1.0f;     // unison until onNewRender draws a detune
         randomBaseFn = defaultSeedDerivedBase;
     }
 
-    // Draw a fresh base center frequency for this render.
+    // Draw a fresh base center frequency AND a fresh detune ratio for this
+    // render. The detune is a plain per-render random value: not a parameter,
+    // not Contour-modulated (see file header).
     void onNewRender( uint32_t seed, int renderIndex )
     {
         float r = randomBaseFn ? randomBaseFn( seed, renderIndex ) : 0.4f;
         baseFreq_ = kBaseFreqMin + r * ( kBaseFreqMax - kBaseFreqMin );
+
+        // Decorrelated hash for the detune draw (distinct constants from
+        // defaultSeedDerivedBase so detune != base pitch draw at a given seed).
+        uint32_t h = seed * 2246822519u + (uint32_t)renderIndex * 3266489917u + 0x9E3779B9u;
+        h ^= h >> 15; h *= 0x85EBCA6Bu; h ^= h >> 13; h *= 0xC2B2AE35u; h ^= h >> 16;
+        float rd = (float)h / 4294967296.0f;                 // [0,1)
+        detuneRatio_ = powf( 2.0f, ( rd * 2.0f - 1.0f ) * kDetuneOct );   // ~0.707 .. 1.414
     }
 
     // freqOffset: Contour-driven, depth-scaled signed Hz offset added to the
     // randomized base. sampleRate is the internal (possibly oversampled) rate.
     float processSample( float x, float freqOffset, float sampleRate )
     {
-        float fc = baseFreq_ + freqOffset;
         float ceil = 0.45f * sampleRate;
         if ( ceil > kFreqCeil ) ceil = kFreqCeil;
+
+        float fc = baseFreq_ + freqOffset;
         if ( fc < kFreqFloor ) fc = kFreqFloor;
         if ( fc > ceil )       fc = ceil;
 
-        float t = tanf( kPi * fc / sampleRate );
-        float a = ( t - 1.0f ) / ( t + 1.0f );   // -90deg at fc; in (-1,1) => stable
+        float fc2 = fc * detuneRatio_;   // second chain detuned, sweeps with fc
+        if ( fc2 < kFreqFloor ) fc2 = kFreqFloor;
+        if ( fc2 > ceil )       fc2 = ceil;
 
-        float w = x;
-        for ( int i = 0; i < kStages; ++i )
-        {
-            float y = a * w + apX1_[i] - a * apY1_[i];
-            apX1_[i] = w;
-            // Denormal flush on the recursive state: with zero input a stable
-            // allpass decays geometrically into denormal range, which the
-            // Cortex-M7 FPU handles far slower than desktop x86 (a CPU-spike /
-            // mute risk inside the feedback loop). Flushing sub-audible values
-            // to 0 is free and audibly a no-op (mirrors feedback_network.h).
-            if ( fabsf( y ) < 1e-20f ) y = 0.0f;
-            apY1_[i] = y;
-            w = y;
-        }
-        // Classic phaser blend: dry + phase-shifted, 0.5 keeps the level sane.
-        return 0.5f * ( x + w );
+        float wA = runChain( apX1_,  apY1_,  coeff( fc,  sampleRate ), x );
+        float wB = runChain( apX1b_, apY1b_, coeff( fc2, sampleRate ), x );
+
+        // Dual-phaser blend: dry + the two detuned wet combs, equal weight.
+        // Collapses to 0.5*(x+w) when detuneRatio_==1, so the level is sane.
+        return 0.5f * ( x + 0.5f * ( wA + wB ) );
     }
 
     float (*randomBaseFn)( uint32_t seed, int renderIndex );
 
 private:
+    static float coeff( float fc, float sampleRate )
+    {
+        float t = tanf( kPi * fc / sampleRate );
+        return ( t - 1.0f ) / ( t + 1.0f );   // -90deg at fc; in (-1,1) => stable
+    }
+
+    static float runChain( float* x1, float* y1, float a, float x )
+    {
+        float w = x;
+        for ( int i = 0; i < kStages; ++i )
+        {
+            float y = a * w + x1[i] - a * y1[i];
+            x1[i] = w;
+            // Denormal flush on the recursive state (Cortex-M7 FPU handles
+            // denormals far slower than desktop x86 — a CPU-spike / mute risk
+            // inside the feedback loop). Mirrors feedback_network.h.
+            if ( fabsf( y ) < 1e-20f ) y = 0.0f;
+            y1[i] = y;
+            w = y;
+        }
+        return w;
+    }
+
     float apX1_[kStages];
     float apY1_[kStages];
+    float apX1b_[kStages];   // second (detuned) chain
+    float apY1b_[kStages];
     float baseFreq_;
+    float detuneRatio_;
 };
 
 } // namespace p4phaser

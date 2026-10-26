@@ -212,11 +212,15 @@ public:
     float playbackGain() const { return currentPeak_ > 1e-4f ? normalizeLevel_ / currentPeak_ : 0.0f; }
     float currentKitPeak() const { return currentPeak_; }   // for tests/UI
 
-    // Starter-wave parameters (§1), pushed straight through to the feedback
-    // network's per-channel generators. Take effect at the next render's
-    // burst (the burst only fires at render start).
-    void setStarterFreq( int ch, float hz ) { net_.starter( ch ).freqHz = hz; }
-    void setStarterDuration( int ch, float sec ) { net_.starter( ch ).durationSec = sec; }
+    // Starter-wave RANDOMIZATION ranges (2026-10-24). Each render, every
+    // channel's starter gets a fresh random frequency in [minF,maxF], length in
+    // [minLenSec,maxLenSec], and waveform (square/saw/triangle/noise), all
+    // seed-derived at startNewRender. Set live from the Starter page.
+    void setStarterRanges( float minF, float maxF, float minLenSec, float maxLenSec )
+    {
+        starterMinFreq_ = minF; starterMaxFreq_ = maxF;
+        starterMinLen_ = minLenSec; starterMaxLen_ = maxLenSec;
+    }
 
     // Per-processor on/off (channel 0..3 = P1..P4). Applied live into each
     // render sample's ChannelControls — a disabled channel is muted in and
@@ -267,6 +271,20 @@ public:
         // (must be set before onNewRender, which regenerates the maps).
         net_.setP1Spectral( p1BlockSize_, p1SwapsPct_, p1SwapSizePct_, p1OmitPct_ );
         net_.onNewRender( perRenderSeed );
+        // Randomize each channel's starter (freq/length/waveform) for this bake.
+        for ( int ch = 0; ch < 4; ++ch )
+        {
+            uint32_t h = perRenderSeed * 2246822519u + (uint32_t)ch * 3266489917u + 0x27D4EB2Fu;
+            h ^= h >> 15; h *= 0x2C1B3C6Du; h ^= h >> 12; h *= 0x297A2D39u; h ^= h >> 15;
+            float rF = (float)h / 4294967296.0f;
+            float rL = (float)( ( h >> 11 ) ^ ( h << 7 ) ) / 4294967296.0f; if ( rL < 0 ) rL = -rL; if ( rL > 1 ) rL -= (int)rL;
+            feedbacknet::StarterWave& sw = net_.starter( ch );
+            float lo = starterMinFreq_, hi = starterMaxFreq_; if ( hi < lo ) { float t = lo; lo = hi; hi = t; }
+            sw.freqHz = lo + rF * ( hi - lo );
+            float llo = starterMinLen_, lhi = starterMaxLen_; if ( lhi < llo ) { float t = llo; llo = lhi; lhi = t; }
+            sw.durationSec = llo + rL * ( lhi - llo );
+            sw.waveform = (int)( h >> 29 ) & 3;   // 0..3: square/saw/triangle/noise
+        }
         // Resolve this render's bandpass center frequencies: VCFRND draws a
         // fresh seed-derived cutoff per channel, otherwise the static Freq
         // params are used. Latch QCONT for the whole bake (toggling it mid-bake
@@ -475,6 +493,8 @@ private:
     // Static per-channel resonant bandpass (Filters page): staggered default
     // centers so the 4 channels occupy distinct bands out of the box; 4-octave
     // (48 semitone) default width.
+    float starterMinFreq_ = 50.0f, starterMaxFreq_ = 500.0f;    // Hz (Starter page)
+    float starterMinLen_ = 0.1f, starterMaxLen_ = 1.0f;         // seconds
     float bpFreq_[4] = { 200.0f, 600.0f, 1500.0f, 4000.0f };
     float bpBwSemis_[4] = { 48.0f, 48.0f, 48.0f, 48.0f };
     bool procEnabled_[4] = { true, true, true, true };

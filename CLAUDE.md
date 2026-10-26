@@ -10,6 +10,14 @@
 
 ---
 
+## WORKFLOW RULE (set 2026-10-24, overrides older "write a test harness" guidance)
+
+- **For the 4x4 plugin, the ONLY deliverables are `4x4/4x4.cpp` and the compiled `4x4/4x4.o`.** Put new feature code in `4x4.cpp`. Do not create any other files — in particular **do NOT write tester / desktop-harness `.cpp` files (`test_*.cpp`, `verify_*.cpp`, `diag_*.cpp`) and do NOT run internal desktop compiles/tests to "validate" behavior.**
+- The only real test is the user running the compiled `.o` on the hardware. After writing `4x4.cpp`, cross-compile it to `4x4.o` (that ARM compile is the one allowed build — it catches compile errors and produces the deliverable) and hand it over for on-device testing. Do not fabricate or imply any other verification.
+- Existing `.h` files may be read and, only if strictly necessary, edited; prefer keeping new code in `4x4.cpp`. Never add new headers or test files.
+
+---
+
 ## Plugin File and Folder Structure
 
 Every plugin has a name. Each plugin lives in its own folder in the project root, named after the plugin.

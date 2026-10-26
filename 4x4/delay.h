@@ -1,20 +1,20 @@
 // delay.h — P3 processor (replaces the former wavefolder, 2026-10-19 on
-// user request): a plain time delay, nothing more. Ranges 1-100ms.
+// user request): a plain time delay, nothing more. Range 10-50ms
+// (narrowed 2026-10-25 from 1-100ms per user request).
 //
 // Follows the same base+depth model as P1/P2 (4x4-System-Overview.md §2/§3):
 // the delay TIME has a randomized per-render base (held for the render),
 // and a Contour-driven, depth-scaled offset moves it around that base,
-// clamped to 1-100ms. "P3 depth" (Depth page) scales that modulation.
+// clamped to 10-50ms. "P3 depth" (Depth page) scales that modulation.
 //
 // MEMORY / OVERSAMPLING (user decision 2026-10-19): the ring buffer is
-// sized for 100ms at the 48kHz BASE rate (kMaxSamples = 4800). The delay
-// runs inside the oversampled feedback loop, so a requested delay of T ms
-// costs T * internalRate/1000 samples; when the buffer can't hold that many
-// (at higher oversampling, or a higher-than-48kHz module rate) the delay is
-// clamped to what fits. Net effect, as agreed: max delay time is ~100ms at
-// 1x and halves per oversampling step (50ms@2x, 25@4x, 12.5@8x). A pure
-// delay doesn't alias, so there's no fidelity cost to it living in the
-// oversampled domain — only this buffer-length scaling.
+// sized for the 50ms maximum at the 48kHz BASE rate (kMaxSamples = 2400;
+// the narrower range freed ~9.6KB of DRAM vs the old 100ms/4800 buffer).
+// The delay runs inside the oversampled feedback loop, so a requested delay
+// of T ms costs T * internalRate/1000 samples; when the buffer can't hold
+// that many (at a higher-than-48kHz module rate) the delay is clamped to
+// what fits. A pure delay doesn't alias, so there's no fidelity cost to it
+// living in the oversampled domain — only this buffer-length scaling.
 //
 // No dynamic allocation, no STL, no exceptions/RTTI, C++11.
 #pragma once
@@ -24,9 +24,9 @@
 
 namespace p3delay {
 
-static const int kMaxSamples = 4800;   // 100ms @ 48kHz base rate
-static const float kMinMs = 1.0f;
-static const float kMaxMs = 100.0f;
+static const int kMaxSamples = 2400;   // 50ms @ 48kHz base rate
+static const float kMinMs = 10.0f;
+static const float kMaxMs = 50.0f;
 
 // Pluggable random-base source, same interface/role as p1pitch/p2freqshift.
 // Distinct additive constant so P3's base draw is decorrelated from the

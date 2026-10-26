@@ -51,21 +51,27 @@
 
 namespace feedbacknet {
 
-// Starter-wave generator (§1 "Starter wave injection"): one phase
-// accumulator per channel, square wave at 50% duty cycle, fires once for
-// durationSec at the start of each render then goes silent.
+// Starter-wave generator (§1 "Starter wave injection"): one phase accumulator
+// per channel, fires once for durationSec at the start of each render then goes
+// silent. Waveform (square/saw/triangle/noise), frequency and duration are
+// randomized per channel per render by the renderer (2026-10-24 user request).
 class StarterWave
 {
 public:
-    StarterWave() : freqHz( 110.0f ), durationSec( 0.2f ), phase_( 0.0f ), sampleIndex_( 0 ) {}
+    enum { kSquare = 0, kSaw = 1, kTriangle = 2, kNoise = 3 };
 
-    float freqHz;        // real _NT_parameter eventually (Step 15)
-    float durationSec;   // real _NT_parameter eventually (Step 15), range 0.1-0.5s per §1
+    StarterWave() : freqHz( 110.0f ), durationSec( 0.2f ), waveform( kSquare ),
+                    phase_( 0.0f ), sampleIndex_( 0 ), rng_( 0x12345u ) {}
 
-    void onNewRender()
+    float    freqHz;       // randomized per render within [MinFreq, MaxFreq]
+    float    durationSec;  // randomized per render within [MinLength, MaxLength]
+    int      waveform;     // randomized per render: square/saw/triangle/noise
+
+    void onNewRender( uint32_t seed )
     {
         phase_ = 0.0f;
         sampleIndex_ = 0;
+        rng_ = seed | 1u;   // deterministic noise per render
     }
 
     float processSample( float sampleRate )
@@ -74,7 +80,14 @@ public:
         float out = 0.0f;
         if ( (float)sampleIndex_ < durationSamples )
         {
-            out = ( phase_ < 0.5f ) ? 5.0f : -5.0f;   // +-5V audio convention
+            switch ( waveform )
+            {
+            case kSaw:      out = ( phase_ * 2.0f - 1.0f ) * 5.0f; break;                 // rising ramp -5..+5
+            case kTriangle: out = ( phase_ < 0.5f ? ( phase_ * 4.0f - 1.0f )
+                                                  : ( 3.0f - phase_ * 4.0f ) ) * 5.0f; break;
+            case kNoise:    out = ( (float)nextRng() / 2147483648.0f - 1.0f ) * 5.0f; break; // white +-5V
+            default:        out = ( phase_ < 0.5f ) ? 5.0f : -5.0f; break;                // square
+            }
             phase_ += freqHz / sampleRate;
             if ( phase_ >= 1.0f ) phase_ -= 1.0f;
         }
@@ -83,8 +96,11 @@ public:
     }
 
 private:
-    float phase_;
+    uint32_t nextRng() { uint32_t x = rng_; x ^= x << 13; x ^= x >> 17; x ^= x << 5; rng_ = x; return x; }
+
+    float    phase_;
     uint32_t sampleIndex_;
+    uint32_t rng_;
 };
 
 // Per-sample, Contour-driven control offsets each processor needs. (The
@@ -129,7 +145,7 @@ public:
         p4_.reset();
         for ( int n = 0; n < 4; ++n )
         {
-            starter_[n].onNewRender();
+            starter_[n].onNewRender( 0x100u + (uint32_t)n );
             bp_[n].reset();
             reg_[n].reset();
         }
@@ -162,7 +178,7 @@ public:
     {
         for ( int n = 0; n < 4; ++n )
         {
-            starter_[n].onNewRender();
+            starter_[n].onNewRender( seed + (uint32_t)n * 2654435761u );
             prevOut_[n] = 0.0f;
             bp_[n].reset();   // state only; coeffs re-set by the renderer post-rate-change
             reg_[n].reset();

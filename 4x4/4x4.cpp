@@ -49,12 +49,423 @@
 #include "renderer.h"
 #include "kit_buffer.h"
 #include <new>
+#include <cmath>
+#include <cstdint>
+
+// ===========================================================================
+// Spectral slice looper ("Content Filter"), 2026-10-24. Playback-only; lives
+// entirely in this file per the workflow rule. When CF ON=1 it replaces the
+// normal loop/time-stretch player: it splits the current play buffer into 1024
+// base slices, measures 8 band energies per slice (streaming SVF bank, chunked
+// so CPU stays flat), merges them at the "Slices" resolution, computes a
+// spectral centroid per merged slice, and loops the slice whose centroid is
+// nearest "Cutoff" (with hysteresis + equal-power crossfades). The analysis
+// runs on kit.current() after each render swap; until the new map is ready it
+// HOLDS the last looped slice (user choice). CF OFF = unchanged behavior.
+// ===========================================================================
+namespace sliceloop {
+
+static const int kBaseSlices = 1024;
+static const int kBands      = 8;
+static const int kNudgeWin   = 64;     // zero-crossing search half-window (samples)
+static const int kAnalyzeChunk = 512;  // kit samples analysed per step() (flat CPU)
+static const float kSilenceFrac = 0.02f;   // slices below this fraction of the loudest are skipped
+
+// 8 octave-spaced band centres (Hz), ~80 Hz .. 10.24 kHz (inside the 32 kHz kit).
+static const float kBandHz[kBands] = { 80.f, 160.f, 320.f, 640.f, 1280.f, 2560.f, 5120.f, 10240.f };
+// "Slices" enum -> number of merged slices.
+static const int kSlicesOptions[7] = { 1024, 512, 256, 128, 64, 32, 16 };
+
+inline float clampf( float v, float lo, float hi ) { return v < lo ? lo : ( v > hi ? hi : v ); }
+
+// Interpolated read of the kit (same convention as the normal player).
+inline float kitInterp( const kitbuffer::KitBuffer& kb, double pos )
+{
+    const int N = kitbuffer::kNumSamples;
+    int i0 = (int)pos; if ( i0 < 0 ) i0 = 0; if ( i0 >= N ) i0 = N - 1;
+    int i1 = i0 + 1; if ( i1 >= N ) i1 = 0;
+    float frac = (float)( pos - (double)i0 );
+    return kb.read( i0 ) * ( 1.0f - frac ) + kb.read( i1 ) * frac;
+}
+
+// A single looping voice over [start, start+loopLen), with an equal-power seam
+// crossfade so the loop has no click, read with per-sample advance `adv`.
+struct LoopVoice
+{
+    double start = 0.0, loopLen = 1.0, phase = 0.0, fadeLen = 0.0;
+
+    float read( const kitbuffer::KitBuffer& kb, double adv )
+    {
+        float main = kitInterp( kb, start + phase );
+        float out = main;
+        if ( fadeLen > 0.0 && phase >= loopLen - fadeLen )
+        {
+            double headPhase = phase - ( loopLen - fadeLen );     // 0..fadeLen
+            float head = kitInterp( kb, start + headPhase );
+            float t = (float)( headPhase / fadeLen );             // 0..1
+            const float kHalfPi = 1.57079633f;
+            float gOut = cosf( t * kHalfPi ), gHead = sinf( t * kHalfPi );
+            out = gOut * main + gHead * head;                     // equal-power tail->head
+        }
+        phase += adv;
+        while ( phase >= loopLen ) phase -= loopLen;
+        return out;
+    }
+};
+
+// Streaming 8-band energy analyzer for one buffer, chunked across step()s.
+class Analyzer
+{
+public:
+    void begin()
+    {
+        float fs = (float)kitbuffer::kSampleRateHz;
+        const float kPi = 3.14159265f, k = 0.70710678f;   // Q ~ 1.41 (octave-ish)
+        for ( int b = 0; b < kBands; ++b )
+        {
+            float g = tanf( kPi * kBandHz[b] / fs );
+            a1_[b] = 1.0f / ( 1.0f + g * ( g + k ) );
+            a2_[b] = g * a1_[b];
+            a3_[b] = g * a2_[b];
+            ic1_[b] = ic2_[b] = 0.0f;
+            acc_[b] = 0.0f;
+        }
+        pos_ = 0; slice_ = 0; done_ = false;
+        nominalNext_ = sliceEnd( 0 );
+        computeNudge( 0 );   // slice 0 start nudge
+    }
+
+    bool done() const { return done_; }
+
+    // Process up to kAnalyzeChunk samples; store finished base slices into map.
+    // Returns true once the whole buffer is analysed.
+    bool chunk( const kitbuffer::KitBuffer& kb, uint16_t energy[kBaseSlices][kBands], int8_t nudge[kBaseSlices] )
+    {
+        if ( done_ ) return true;
+        const int N = kitbuffer::kNumSamples;
+        int processed = 0;
+        while ( pos_ < N && processed < kAnalyzeChunk )
+        {
+            float x = kb.read( pos_ );
+            for ( int b = 0; b < kBands; ++b )
+            {
+                float v3 = x - ic2_[b];
+                float v1 = a1_[b] * ic1_[b] + a2_[b] * v3;
+                float v2 = ic2_[b] + a2_[b] * ic1_[b] + a3_[b] * v3;
+                ic1_[b] = 2.0f * v1 - ic1_[b];
+                ic2_[b] = 2.0f * v2 - ic2_[b];
+                acc_[b] += v1 * v1;                     // band energy (bandpass^2)
+            }
+            ++pos_; ++processed;
+            if ( pos_ >= nominalNext_ )                 // finished base slice slice_
+            {
+                finishSlice( slice_, energy );
+                nudge[slice_] = pendingNudge_;
+                ++slice_;
+                if ( slice_ >= kBaseSlices ) { done_ = true; break; }
+                nominalNext_ = sliceEnd( slice_ );
+                computeNudge( slice_ );
+            }
+        }
+        if ( pos_ >= N && !done_ )                      // flush the last partial slice
+        {
+            finishSlice( slice_, energy );
+            nudge[slice_] = pendingNudge_;
+            for ( int s = slice_ + 1; s < kBaseSlices; ++s )
+            { for ( int b = 0; b < kBands; ++b ) energy[s][b] = 0; nudge[s] = 0; }
+            done_ = true;
+        }
+        return done_;
+    }
+
+    static int sliceStart( int i ) { return (int)( (int64_t)i * kitbuffer::kNumSamples / kBaseSlices ); }
+
+private:
+    static int sliceEnd( int i ) { return sliceStart( i + 1 ); }
+
+    void finishSlice( int i, uint16_t energy[kBaseSlices][kBands] )
+    {
+        int len = sliceEnd( i ) - sliceStart( i ); if ( len < 1 ) len = 1;
+        // meanSquare per band, referenced to 11V^2 full-scale -> uint16.
+        float scale = 65535.0f / ( (float)len * 121.0f );
+        for ( int b = 0; b < kBands; ++b )
+        {
+            float e = acc_[b] * scale;
+            energy[i][b] = (uint16_t)clampf( e, 0.0f, 65535.0f );
+            acc_[b] = 0.0f;
+        }
+    }
+
+    // Nearest zero crossing to the nominal start of slice i, within +-kNudgeWin.
+    void computeNudge( int i )
+    {
+        const int N = kitbuffer::kNumSamples;
+        int nom = sliceStart( i );
+        pendingNudge_ = 0;
+        if ( nom <= 0 || nom >= N - 1 ) return;
+        for ( int d = 0; d <= kNudgeWin; ++d )
+        {
+            int p = nom + d;
+            if ( p >= 1 && p < N && signChange( kb_, p ) ) { pendingNudge_ = clampNudge( d ); return; }
+            p = nom - d;
+            if ( p >= 1 && p < N && signChange( kb_, p ) ) { pendingNudge_ = clampNudge( -d ); return; }
+        }
+    }
+    static int8_t clampNudge( int d ) { if ( d > 127 ) d = 127; if ( d < -128 ) d = -128; return (int8_t)d; }
+
+    // kb_ is set by chunk() each call so computeNudge (called from begin/chunk) can read.
+public:
+    void setBuffer( const kitbuffer::KitBuffer* kb ) { kb_ = kb; }
+private:
+    static bool signChange( const kitbuffer::KitBuffer* kb, int p )
+    {
+        float a = kb->read( p - 1 ), b = kb->read( p );
+        return ( a < 0.0f ) != ( b < 0.0f );
+    }
+
+    const kitbuffer::KitBuffer* kb_ = nullptr;
+    float a1_[kBands], a2_[kBands], a3_[kBands], ic1_[kBands], ic2_[kBands], acc_[kBands];
+    int   pos_ = 0, slice_ = 0, nominalNext_ = 0;
+    int8_t pendingNudge_ = 0;
+    bool  done_ = true;
+};
+
+// Cutoff knob (0..1) -> target centroid frequency, log 20..20000 Hz.
+inline float cutoffHz( float c01 ) { return 20.0f * expf( c01 * 6.9077553f ); }
+
+// -----------------------------------------------------------------------------
+// SliceAnalysis — SHARED per-buffer analysis (lives in DRAM). Built once per
+// render from kit.current(); the merged map (at the global "Slices" grain) is
+// sorted by centroid so each player can pick a slice by Cutoff + a rank offset.
+// -----------------------------------------------------------------------------
+class SliceAnalysis
+{
+public:
+    SliceAnalysis() { for ( int b = 0; b < kBands; ++b ) logBand_[b] = logf( kBandHz[b] ); reset(); }
+
+    void reset() { ready_ = false; lastSlicesIdx_ = -1; mergedCount_ = 0; validCount_ = 0; }
+    bool ready() const { return ready_; }
+
+    void onBufferChanged( const kitbuffer::KitBuffer& kb )
+    {
+        ready_ = false; lastSlicesIdx_ = -1;
+        analyzer_.setBuffer( &kb );
+        analyzer_.begin();
+    }
+
+    void analyzeChunk( const kitbuffer::KitBuffer& kb )
+    {
+        if ( ready_ ) return;
+        analyzer_.setBuffer( &kb );
+        if ( analyzer_.chunk( kb, energy_, nudge_ ) ) ready_ = true;
+    }
+
+    // Rebuild the merged map + sorted order when the global Slices grain changes
+    // (or the first time after analysis completes). Cheap; call once per block.
+    void rebuildIfNeeded( int slicesIdx )
+    {
+        if ( !ready_ ) return;
+        if ( slicesIdx < 0 ) slicesIdx = 0;
+        if ( slicesIdx > 6 ) slicesIdx = 6;
+        if ( slicesIdx == lastSlicesIdx_ ) return;
+        lastSlicesIdx_ = slicesIdx;
+        rebuildMerged( slicesIdx );
+        sortValidByCentroid();
+    }
+
+    bool hasValid() const { return validCount_ > 0; }
+
+    // Pick a slice by Cutoff (nearest centroid) stepped by a rank offset derived
+    // from startPos01 (0 = nearest to Cutoff, up = progressively brighter).
+    // Returns the slice's zero-crossing start sample and its centroid.
+    bool select( float cutoff01, float startPos01, double& outStartSample, float& outCentroid ) const
+    {
+        if ( validCount_ <= 0 ) return false;
+        float target = logf( cutoffHz( cutoff01 ) );
+        // binary search for the first centroid >= target (ascending order)
+        int lo = 0, hi = validCount_ - 1, ins = validCount_;
+        while ( lo <= hi )
+        {
+            int mid = ( lo + hi ) >> 1;
+            if ( mergedCentroid_[sortedIdx_[mid]] >= target ) { ins = mid; hi = mid - 1; }
+            else lo = mid + 1;
+        }
+        int nearest;
+        if ( ins <= 0 ) nearest = 0;
+        else if ( ins >= validCount_ ) nearest = validCount_ - 1;
+        else
+        {
+            float dHi = fabsf( mergedCentroid_[sortedIdx_[ins]] - target );
+            float dLo = fabsf( mergedCentroid_[sortedIdx_[ins - 1]] - target );
+            nearest = ( dLo <= dHi ) ? ins - 1 : ins;
+        }
+        int step = (int)( startPos01 * (float)( validCount_ - 1 ) + 0.5f );
+        int rank = nearest + step;
+        if ( rank < 0 ) rank = 0;
+        if ( rank > validCount_ - 1 ) rank = validCount_ - 1;
+        int m = sortedIdx_[rank];
+        int base = mergedStartBase_[m];
+        outStartSample = (double)( Analyzer::sliceStart( base ) + nudge_[base] );
+        outCentroid = mergedCentroid_[m];
+        return true;
+    }
+
+private:
+    void rebuildMerged( int slicesIdx )
+    {
+        int count = kSlicesOptions[slicesIdx];
+        int group = kBaseSlices / count;
+        mergedCount_ = count;
+        float maxTotal = 0.0f;
+        for ( int m = 0; m < count; ++m )
+        {
+            uint32_t sum[kBands]; for ( int b = 0; b < kBands; ++b ) sum[b] = 0;
+            int base0 = m * group;
+            for ( int j = 0; j < group; ++j )
+                for ( int b = 0; b < kBands; ++b ) sum[b] += energy_[base0 + j][b];
+            float num = 0.0f, den = 0.0f;
+            for ( int b = 0; b < kBands; ++b ) { float e = (float)sum[b]; num += e * logBand_[b]; den += e; }
+            mergedStartBase_[m] = (uint16_t)base0;
+            mergedCentroid_[m] = ( den > 0.0f ) ? ( num / den ) : -1.0f;
+            if ( den > maxTotal ) maxTotal = den;
+        }
+        float thr = maxTotal * kSilenceFrac;
+        for ( int m = 0; m < count; ++m )
+        {
+            if ( mergedCentroid_[m] < 0.0f ) continue;
+            int base0 = m * group; float den = 0.0f;
+            for ( int j = 0; j < group; ++j )
+                for ( int b = 0; b < kBands; ++b ) den += (float)energy_[base0 + j][b];
+            if ( den < thr ) mergedCentroid_[m] = -1.0f;   // near-silent -> skip
+        }
+    }
+
+    // Collect valid (non-silent) merged indices and heapsort by centroid asc.
+    void sortValidByCentroid()
+    {
+        validCount_ = 0;
+        for ( int m = 0; m < mergedCount_; ++m )
+            if ( mergedCentroid_[m] >= 0.0f ) sortedIdx_[validCount_++] = (uint16_t)m;
+        int nn = validCount_;
+        for ( int i = nn / 2 - 1; i >= 0; --i ) siftDown( i, nn );
+        for ( int end = nn - 1; end > 0; --end )
+        {
+            uint16_t t = sortedIdx_[0]; sortedIdx_[0] = sortedIdx_[end]; sortedIdx_[end] = t;
+            siftDown( 0, end );
+        }
+    }
+    void siftDown( int root, int n )
+    {
+        while ( true )
+        {
+            int child = 2 * root + 1; if ( child >= n ) break;
+            if ( child + 1 < n && mergedCentroid_[sortedIdx_[child + 1]] > mergedCentroid_[sortedIdx_[child]] ) ++child;
+            if ( mergedCentroid_[sortedIdx_[child]] <= mergedCentroid_[sortedIdx_[root]] ) break;
+            uint16_t t = sortedIdx_[root]; sortedIdx_[root] = sortedIdx_[child]; sortedIdx_[child] = t;
+            root = child;
+        }
+    }
+
+    Analyzer analyzer_;
+    uint16_t energy_[kBaseSlices][kBands];   // per base slice band energy
+    int8_t   nudge_[kBaseSlices];            // per base slice zero-crossing start nudge
+    float    mergedCentroid_[kBaseSlices];   // per merged slice log-centroid (-1 = silent)
+    uint16_t mergedStartBase_[kBaseSlices];  // per merged slice: first base-slice index
+    uint16_t sortedIdx_[kBaseSlices];        // valid merged indices, sorted by centroid asc
+    float    logBand_[kBands];
+    int      mergedCount_ = 0, validCount_ = 0, lastSlicesIdx_ = -1;
+    bool     ready_ = false;
+};
+
+// -----------------------------------------------------------------------------
+// SlicePlayer — PER-PLAYER CF playback (lives in SRAM). Selects + loops a slice
+// from the shared SliceAnalysis; equal-power crossfade on seam and switches.
+// Returns raw samples; the caller applies the envelope and normalize gain.
+// -----------------------------------------------------------------------------
+class SlicePlayer
+{
+public:
+    SlicePlayer() { reset(); }
+    void reset() { haveCur_ = false; switching_ = false; curStart_ = -1.0; curCentroid_ = 0.0f; }
+    void retrigger() { cur_.phase = 0.0; switching_ = false; }   // note-on: restart the loop
+
+    void selectPerBlock( const SliceAnalysis& an, float cutoff01, float startPos01,
+                         float hystSemis, float sliceLenMs, float crossfadeMs, float sampleRate )
+    {
+        if ( !an.ready() || !an.hasValid() ) return;   // hold whatever we have
+        double startS; float cen;
+        if ( !an.select( cutoff01, startPos01, startS, cen ) ) return;
+
+        float target = logf( cutoffHz( cutoff01 ) );
+        float hystLog = hystSemis * ( 0.69314718f / 12.0f );
+        if ( !haveCur_ )
+        {
+            setVoice( cur_, startS, sliceLenMs, crossfadeMs );
+            curStart_ = startS; curCentroid_ = cen; haveCur_ = true; return;
+        }
+        if ( startS == curStart_ ) { refreshVoiceLen( cur_, sliceLenMs, crossfadeMs ); return; }
+        float candD = fabsf( cen - target ), curD = fabsf( curCentroid_ - target );
+        if ( candD < curD - hystLog )
+        {
+            old_ = cur_; switching_ = true; switchPhase_ = 0.0;
+            switchLen_ = (double)crossfadeMs * 0.001 * (double)sampleRate;
+            if ( switchLen_ < 1.0 ) switchLen_ = 1.0;
+            setVoice( cur_, startS, sliceLenMs, crossfadeMs );
+            curStart_ = startS; curCentroid_ = cen;
+        }
+        else refreshVoiceLen( cur_, sliceLenMs, crossfadeMs );
+    }
+
+    float processSample( const kitbuffer::KitBuffer& kb, double adv )
+    {
+        if ( !haveCur_ ) return 0.0f;
+        float s = cur_.read( kb, adv );
+        if ( switching_ )
+        {
+            float o = old_.read( kb, adv );
+            float t = (float)( switchPhase_ / switchLen_ ); if ( t > 1.0f ) t = 1.0f;
+            const float kHalfPi = 1.57079633f;
+            s = sinf( t * kHalfPi ) * s + cosf( t * kHalfPi ) * o;
+            switchPhase_ += 1.0;
+            if ( switchPhase_ >= switchLen_ ) switching_ = false;
+        }
+        return s;
+    }
+
+private:
+    void setVoice( LoopVoice& v, double startS, float sliceLenMs, float crossfadeMs )
+    {
+        v.start = startS; v.phase = 0.0;
+        refreshVoiceLen( v, sliceLenMs, crossfadeMs );
+    }
+    void refreshVoiceLen( LoopVoice& v, float sliceLenMs, float crossfadeMs )
+    {
+        double len = (double)sliceLenMs * 0.001 * (double)kitbuffer::kSampleRateHz;
+        if ( len < 2.0 ) len = 2.0;
+        double maxLen = (double)kitbuffer::kNumSamples - v.start - 1.0;
+        if ( len > maxLen ) len = maxLen;
+        v.loopLen = len;
+        double f = (double)crossfadeMs * 0.001 * (double)kitbuffer::kSampleRateHz;
+        if ( f > len * 0.5 ) f = len * 0.5;
+        if ( f < 0.0 ) f = 0.0;
+        v.fadeLen = f;
+        if ( v.phase >= v.loopLen ) v.phase = 0.0;
+    }
+
+    LoopVoice cur_, old_;
+    double curStart_ = -1.0, switchPhase_ = 0.0, switchLen_ = 1.0;
+    float  curCentroid_ = 0.0f;
+    bool   haveCur_ = false, switching_ = false;
+};
+
+} // namespace sliceloop
 
 // Everything large, placed into the DRAM block the firmware provides.
 struct Engine
 {
     renderer::Renderer         renderer;
     kitbuffer::DoubleBufferedKit kit;
+    sliceloop::SliceAnalysis   sliceAnalysis;   // shared per-buffer slice map (4 players read it)
 };
 
 // Compile-time budget guard: the firmware's DRAM pool is 512KB, shared with
@@ -69,18 +480,60 @@ struct Engine
 static_assert( sizeof( Engine ) <= 512 * 1024 - 16384,
                "Engine + ~8KB static .bss would exceed the 512KB DRAM pool — trim the kit (kit_buffer.h). See the 2026-10-20 regression fix." );
 
+// One note-gated voice (4 of them, all reading the shared kit buffer). Small
+// state only -> lives in SRAM with the algorithm instance. Each has a gated AHR
+// volume envelope plus its own stretch read head and CF slice-looper state.
+struct Player
+{
+    enum { kIdle = 0, kAttack = 1, kSustain = 2, kRelease = 3 };
+    int    envState;
+    float  envCounter, envOut, relLevel;
+    bool   gate;    // MIDI note held (set by midiMessage)
+    bool   trig;    // pending note-on edge (consumed by step)
+    timestretch::StretchReader reader;   // CF-off (time-stretch) playback
+    sliceloop::SlicePlayer     slice;    // CF-on (content filter) playback
+
+    Player() : envState(kIdle), envCounter(0.f), envOut(0.f), relLevel(0.f), gate(false), trig(false) {}
+    void noteOn()  { gate = true; trig = true; }
+    void noteOff() { gate = false; }
+
+    // Gated AHR: attack -> sustain(100% while held) -> release on note-off.
+    // Fixed power curve (exp 3), like AHRVCA but with gate-length hold.
+    float envProcess( float atkSamp, float relSamp )
+    {
+        const float e = 3.0f;
+        if ( ( envState == kAttack || envState == kSustain ) && !gate )
+        { envState = kRelease; envCounter = 0.f; relLevel = envOut; }
+        switch ( envState )
+        {
+        case kAttack: {
+            float t = atkSamp > 0.f ? envCounter / atkSamp : 1.f;
+            if ( t >= 1.f ) { envState = kSustain; envCounter = 0.f; envOut = 1.f; }
+            else { envOut = 1.f - powf( 1.f - t, e ); envCounter += 1.f; }
+            break; }
+        case kSustain: envOut = 1.f; break;
+        case kRelease: {
+            float t = relSamp > 0.f ? envCounter / relSamp : 1.f;
+            if ( t >= 1.f ) { envState = kIdle; envOut = 0.f; }
+            else { envOut = relLevel * powf( 1.f - t, e ); envCounter += 1.f; }
+            break; }
+        default: envOut = 0.f; break;
+        }
+        return envOut;
+    }
+};
+
 struct FourByFourAlg : public _NT_algorithm
 {
     Engine* engine;
-    timestretch::StretchReader reader;   // period-synchronous playback read head
-    uint32_t lastSwapGen;                // last seen renderer swap generation (reset reader on change)
-    int     prevRegen;  // previous Regenerate value, for 0->1 edge detection in step()
+    Player   players[4];
+    uint32_t lastSwapGen;   // last seen renderer swap generation
+    uint32_t sliceGen;      // swap generation the shared slice analysis was (re)started for
+    int      prevRegen;     // previous Regenerate value, for 0->1 edge detection in step()
 
     // Initialize only our OWN members. Deliberately do NOT touch the base's
-    // v / vIncludingCommon — those are system-managed (api.h), and the
-    // monosynth example likewise leaves them alone so a firmware-set pointer
-    // is never clobbered. parameters / parameterPages are set in construct().
-    FourByFourAlg() : engine( nullptr ), lastSwapGen( 0 ), prevRegen( 0 ) {}
+    // v / vIncludingCommon — those are system-managed (api.h).
+    FourByFourAlg() : engine( nullptr ), lastSwapGen( 0 ), sliceGen( 0xFFFFFFFFu ), prevRegen( 0 ) {}
 };
 
 // Fixed base seed for reproducibility (§10's seed-derived-vs-entropy
@@ -88,136 +541,142 @@ struct FourByFourAlg : public _NT_algorithm
 // renderIndex increments per render so successive bakes still differ).
 static const uint32_t kBaseSeed = 0x34783446u;   // "4x4F"
 
+// Per-player field order (used both to lay out the 32 player params and to
+// index them at runtime). playerParam(p,f) = kParamPlayerBase + p*8 + f.
+enum { PF_StartPos = 0, PF_Pitch, PF_Attack, PF_Release, PF_Stretch, PF_CF, PF_Cutoff, PF_SliceLen, PF_COUNT };
+
 enum {
-    kParamStarterFreq1, kParamStarterFreq2, kParamStarterFreq3, kParamStarterFreq4,
-    kParamStarterLen1,  kParamStarterLen2,  kParamStarterLen3,  kParamStarterLen4,
-    kParamP1Depth,
-    kParamP2Depth,
-    kParamP3Depth,      // delay-time modulation depth (P1/P2 model)
-    kParamP4Depth,      // phaser center-freq sweep depth (P1/P2 model)
-    kParamRegenerate,
-    kParamPlay,
-    kParamOversample,   // render-quality: 1x/2x/4x/8x internal oversampling
-    kParamWindows,      // Contour settings bank (global, per-instance seeds)
-    kParamChaos,
-    kParamRadius,
-    kParamRoundProb,
-    kParamHoldProb,
-    kParamBpFreq1, kParamBpFreq2, kParamBpFreq3, kParamBpFreq4,   // per-channel resonant bandpass: center freq
-    kParamBpBw1, kParamBpBw2, kParamBpBw3, kParamBpBw4,          // ...and bandwidth (semitones)
-    kParamP1Enable,     // per-processor on/off (muted in & out when off)
-    kParamP2Enable,
-    kParamP3Enable,
-    kParamP4Enable,
-    kParamOutput,
-    kParamOutputMode,
-    // NEW PARAMS GO HERE, AT THE END. Never insert mid-list: the firmware
-    // restores a saved preset's values BY INDEX, so shifting an existing
-    // param's index remaps stale values onto it (that's what sent Output ->
-    // Input 1 when Pitch was briefly inserted mid-list, 2026-10-21).
-    kParamPitch,        // playback pitch via speed, +-48 semitones (+-4 octaves)
-    kParamVcfRnd,       // Filters: randomize bandpass center freqs every render
-    kParamQCont,        // Filters: modulate bandpass Q (bandwidth) with a Contour
-    kParamNormLevel,    // Render: peak level (V) the kit is normalized to at playback
-    kParamScale,        // Stretch: which repetition length to target (0..1 across octave scales)
-    kParamStretch,      // Stretch: plays per slice, 1x..8x (finite; 1x = passthrough)
-    kParamThreshold,    // Stretch: min periodicity confidence before stretching
-    kParamXfade,        // Stretch: splice crossfade length (ms)
-    kParamBlockSize,    // Shifter (P1): bins per block for swap/mute (enum 1..64)
-    kParamSwaps,        // Shifter (P1): block-pair swaps, 0..100% of max
-    kParamSwapSize,     // Shifter (P1): max swap distance, 0..100% of max
-    kParamOmit,         // Shifter (P1): blocks muted before the shift, 0..100% of max
+    // RENDER (sticky switches; Regenerate fires on 0->1, both positions stick)
+    kParamRegenerate, kParamPlay,
+    // STARTER (randomization ranges; freq/length/waveform randomized per render)
+    kParamMinFreq, kParamMaxFreq, kParamMinLen, kParamMaxLen,
+    // DEPTH (Contour modulation amount per processor)
+    kParamShifterDepth, kParamFreqDepth, kParamDelayDepth, kParamPhaserDepth,
+    // CONTOUR
+    kParamWindows, kParamChaos, kParamRadius, kParamRoundProb, kParamHoldProb,
+    // FILTERS
+    kParamBpFreq1, kParamBpFreq2, kParamBpFreq3, kParamBpFreq4,
+    kParamBpBw1, kParamBpBw2, kParamBpBw3, kParamBpBw4,
+    kParamVcfRnd, kParamQCont,
+    // SHIFTER (P1 spectral manipulation)
+    kParamBlockSize, kParamSwaps, kParamSwapSize, kParamOmit,
+    // PLAYERS 1..4 — 32 params (8 per player, field order PF_*)
+    kParamPlayerBase,
+    // REST (globals shared by all players)
+    kParamThreshold = kParamPlayerBase + 4 * PF_COUNT,
+    kParamXfade, kParamSlices, kParamHyst, kParamCrossfade,
+    // ROUTING
+    kParamOutput, kParamOutputMode,
+    kParamNote1, kParamNote2, kParamNote3, kParamNote4,
+    kNumParams
 };
+
+inline int playerParam( int p, int f ) { return kParamPlayerBase + p * PF_COUNT + f; }
 
 static char const* const regenStrings[] = { "Hold", "Regenerate", NULL };
 static char const* const playStrings[]  = { "Off", "On", NULL };
-static char const* const osStrings[]    = { "1x", "2x", "4x", "8x", NULL };
 static char const* const blockSizeStrings[] = { "1", "2", "4", "8", "16", "32", "64", NULL };
 static const int kBlockSizeBins[] = { 1, 2, 4, 8, 16, 32, 64 };   // enum index -> bins
+static char const* const slicesStrings[] = { "1024", "512", "256", "128", "64", "32", "16", NULL };
+
+// 8 player params per player; CF Cutoff uses kNT_unitHasStrings for a Hz readout.
+#define PLAYER_PARAMS(N) \
+    { .name = "P" #N " StartPos", .min=0,   .max=100,  .def=0,   .unit=kNT_unitPercent,    .scaling=0,              .enumStrings=NULL }, \
+    { .name = "P" #N " Pitch",    .min=-48, .max=48,   .def=0,   .unit=kNT_unitSemitones,  .scaling=0,              .enumStrings=NULL }, \
+    { .name = "P" #N " Attack",   .min=1,   .max=500,  .def=5,   .unit=kNT_unitMs,         .scaling=0,              .enumStrings=NULL }, \
+    { .name = "P" #N " Release",  .min=1,   .max=1000, .def=150, .unit=kNT_unitMs,         .scaling=0,              .enumStrings=NULL }, \
+    { .name = "P" #N " Stretch",  .min=100, .max=800,  .def=100, .unit=kNT_unitNone,       .scaling=kNT_scaling100, .enumStrings=NULL }, \
+    { .name = "P" #N " CF",       .min=0,   .max=1,    .def=0,   .unit=kNT_unitEnum,       .scaling=0,              .enumStrings=playStrings }, \
+    { .name = "P" #N " Cutoff",   .min=0,   .max=1000, .def=500, .unit=kNT_unitHasStrings, .scaling=0,              .enumStrings=NULL }, \
+    { .name = "P" #N " SliceLen", .min=1,   .max=1000, .def=100, .unit=kNT_unitMs,         .scaling=0,              .enumStrings=NULL },
 
 static const _NT_parameter parameters[] = {
-    { .name = "S1 freq", .min = 20, .max = 2000, .def = 110, .unit = kNT_unitHz, .scaling = 0, .enumStrings = NULL },   // 0
-    { .name = "S2 freq", .min = 20, .max = 2000, .def = 110, .unit = kNT_unitHz, .scaling = 0, .enumStrings = NULL },   // 1
-    { .name = "S3 freq", .min = 20, .max = 2000, .def = 110, .unit = kNT_unitHz, .scaling = 0, .enumStrings = NULL },   // 2
-    { .name = "S4 freq", .min = 20, .max = 2000, .def = 110, .unit = kNT_unitHz, .scaling = 0, .enumStrings = NULL },   // 3
-    { .name = "S1 len", .min = 1, .max = 500, .def = 200, .unit = kNT_unitMs, .scaling = 0, .enumStrings = NULL },      // 4
-    { .name = "S2 len", .min = 1, .max = 500, .def = 200, .unit = kNT_unitMs, .scaling = 0, .enumStrings = NULL },      // 5
-    { .name = "S3 len", .min = 1, .max = 500, .def = 200, .unit = kNT_unitMs, .scaling = 0, .enumStrings = NULL },      // 6
-    { .name = "S4 len", .min = 1, .max = 500, .def = 200, .unit = kNT_unitMs, .scaling = 0, .enumStrings = NULL },      // 7
-    { .name = "P1 depth", .min = 0, .max = 100, .def = 100, .unit = kNT_unitPercent, .scaling = 0, .enumStrings = NULL }, // 8
-    { .name = "P2 depth", .min = 0, .max = 100, .def = 100, .unit = kNT_unitPercent, .scaling = 0, .enumStrings = NULL }, // 9
-    { .name = "P3 depth", .min = 0, .max = 100, .def = 100, .unit = kNT_unitPercent, .scaling = 0, .enumStrings = NULL }, // 10
-    { .name = "P4 depth", .min = 0, .max = 100, .def = 100, .unit = kNT_unitPercent, .scaling = 0, .enumStrings = NULL }, // 11
-    { .name = "Regenerate", .min = 0, .max = 1, .def = 0, .unit = kNT_unitEnum, .scaling = 0, .enumStrings = regenStrings }, // 12
-    { .name = "Play", .min = 0, .max = 1, .def = 1, .unit = kNT_unitEnum, .scaling = 0, .enumStrings = playStrings }, // 13
-    { .name = "Oversample", .min = 0, .max = 3, .def = 0, .unit = kNT_unitEnum, .scaling = 0, .enumStrings = osStrings }, // 14
-    { .name = "Windows", .min = 1, .max = 32, .def = 6, .unit = kNT_unitNone, .scaling = 0, .enumStrings = NULL },        // 15
-    { .name = "Chaos", .min = 0, .max = 100, .def = 60, .unit = kNT_unitPercent, .scaling = 0, .enumStrings = NULL },     // 16
-    { .name = "Radius", .min = 0, .max = 500, .def = 120, .unit = kNT_unitMs, .scaling = 0, .enumStrings = NULL },        // 17
-    { .name = "Round prob", .min = 0, .max = 100, .def = 100, .unit = kNT_unitPercent, .scaling = 0, .enumStrings = NULL }, // 18
-    { .name = "Hold prob", .min = 0, .max = 100, .def = 0, .unit = kNT_unitPercent, .scaling = 0, .enumStrings = NULL },   // 19
-    { .name = "Freq 1", .min = 20, .max = 16000, .def = 200, .unit = kNT_unitHz, .scaling = 0, .enumStrings = NULL },     // 20  bandpass centers,
-    { .name = "Freq 2", .min = 20, .max = 16000, .def = 600, .unit = kNT_unitHz, .scaling = 0, .enumStrings = NULL },     // 21  staggered so the
-    { .name = "Freq 3", .min = 20, .max = 16000, .def = 1500, .unit = kNT_unitHz, .scaling = 0, .enumStrings = NULL },    // 22  4 channels occupy
-    { .name = "Freq 4", .min = 20, .max = 16000, .def = 4000, .unit = kNT_unitHz, .scaling = 0, .enumStrings = NULL },    // 23  distinct bands
-    { .name = "BW 1", .min = 1, .max = 96, .def = 48, .unit = kNT_unitSemitones, .scaling = 0, .enumStrings = NULL },     // 24  bandwidth, 1 semitone
-    { .name = "BW 2", .min = 1, .max = 96, .def = 48, .unit = kNT_unitSemitones, .scaling = 0, .enumStrings = NULL },     // 25  .. 8 octaves (96 st)
-    { .name = "BW 3", .min = 1, .max = 96, .def = 48, .unit = kNT_unitSemitones, .scaling = 0, .enumStrings = NULL },     // 26
-    { .name = "BW 4", .min = 1, .max = 96, .def = 48, .unit = kNT_unitSemitones, .scaling = 0, .enumStrings = NULL },     // 27
-    { .name = "P1 pitch", .min = 0, .max = 1, .def = 1, .unit = kNT_unitEnum, .scaling = 0, .enumStrings = playStrings },  // 28
-    { .name = "P2 freq",  .min = 0, .max = 1, .def = 1, .unit = kNT_unitEnum, .scaling = 0, .enumStrings = playStrings },  // 29
-    { .name = "P3 delay", .min = 0, .max = 1, .def = 1, .unit = kNT_unitEnum, .scaling = 0, .enumStrings = playStrings },  // 30
-    { .name = "P4 phaser", .min = 0, .max = 1, .def = 1, .unit = kNT_unitEnum, .scaling = 0, .enumStrings = playStrings }, // 31
-    NT_PARAMETER_AUDIO_OUTPUT_WITH_MODE( "Output", 1, 13 )   // 32, 33
-    // Pitch appended LAST (index 34) so adding it never shifts Output/other
-    // indices — see the enum note. Playback speed, +-48 semitones (+-4 oct).
-    { .name = "Pitch", .min = -48, .max = 48, .def = 0, .unit = kNT_unitSemitones, .scaling = 0, .enumStrings = NULL },   // 34
-    // VCFRND / QCONT appended LAST (indices 35, 36), same end-of-list rule.
-    // Both default Off, so a preset from the pre-feature version loads with the
-    // static Freq/BW behavior unchanged.
-    { .name = "VCFRND", .min = 0, .max = 1, .def = 0, .unit = kNT_unitEnum, .scaling = 0, .enumStrings = playStrings },  // 35
-    { .name = "QCONT",  .min = 0, .max = 1, .def = 0, .unit = kNT_unitEnum, .scaling = 0, .enumStrings = playStrings },  // 36
-    // Render output level: the baked kit is peak-normalized to this at playback
-    // (0..11V). Appended LAST (index 37) per the end-of-list ordering rule.
-    { .name = "Norm level", .min = 0, .max = 11, .def = 8, .unit = kNT_unitVolts, .scaling = 0, .enumStrings = NULL }, // 37
-    // Time-stretch (period-synchronous, playback-only). Appended LAST (38..41)
-    // per the end-of-list ordering rule. At Stretch=100 (1.00x) playback is
-    // bit-identical to the plain looping player.
-    { .name = "Scale", .min = 0, .max = 100, .def = 50, .unit = kNT_unitPercent, .scaling = 0, .enumStrings = NULL },        // 38
-    { .name = "Stretch", .min = 100, .max = 800, .def = 100, .unit = kNT_unitNone, .scaling = kNT_scaling100, .enumStrings = NULL }, // 39 (1.00x..8.00x plays/slice, finite)
-    { .name = "Threshold", .min = 0, .max = 100, .def = 30, .unit = kNT_unitPercent, .scaling = 0, .enumStrings = NULL },    // 40
-    { .name = "Xfade", .min = 1, .max = 50, .def = 10, .unit = kNT_unitMs, .scaling = 0, .enumStrings = NULL },              // 41
-    // P1 spectral manipulation (Shifter page). Appended at the end (42..45).
-    // Defaults = clean full-spectrum shift: Swaps/Omit at 0% do nothing.
-    { .name = "BlockSize", .min = 0, .max = 6, .def = 3, .unit = kNT_unitEnum, .scaling = 0, .enumStrings = blockSizeStrings }, // 42 (bins: index->1..64, def 8)
-    { .name = "Swaps", .min = 0, .max = 100, .def = 0, .unit = kNT_unitPercent, .scaling = 0, .enumStrings = NULL },            // 43
-    { .name = "SwapSize", .min = 0, .max = 100, .def = 50, .unit = kNT_unitPercent, .scaling = 0, .enumStrings = NULL },        // 44
-    { .name = "Omit", .min = 0, .max = 100, .def = 0, .unit = kNT_unitPercent, .scaling = 0, .enumStrings = NULL },             // 45
+    // RENDER
+    { .name = "Regenerate", .min=0, .max=1, .def=0, .unit=kNT_unitEnum, .scaling=0, .enumStrings=regenStrings },  // sticky; render on 0->1
+    { .name = "Play",       .min=0, .max=1, .def=1, .unit=kNT_unitEnum, .scaling=0, .enumStrings=playStrings },   // master enable (Off = silence)
+    // STARTER (randomized per render: freq in [Min,Max]Hz, length in [Min,Max]ms, waveform sq/saw/tri/noise)
+    { .name = "MinFreq",   .min=20, .max=2000, .def=50,   .unit=kNT_unitHz, .scaling=0, .enumStrings=NULL },
+    { .name = "MaxFreq",   .min=20, .max=2000, .def=500,  .unit=kNT_unitHz, .scaling=0, .enumStrings=NULL },
+    { .name = "MinLength", .min=100,.max=1000, .def=100,  .unit=kNT_unitMs, .scaling=0, .enumStrings=NULL },      // 0.1 .. 1 s
+    { .name = "MaxLength", .min=100,.max=1000, .def=1000, .unit=kNT_unitMs, .scaling=0, .enumStrings=NULL },
+    // DEPTH
+    { .name = "ShifterDepth", .min=0, .max=100, .def=100, .unit=kNT_unitPercent, .scaling=0, .enumStrings=NULL },
+    { .name = "FreqDepth",    .min=0, .max=100, .def=100, .unit=kNT_unitPercent, .scaling=0, .enumStrings=NULL },
+    { .name = "DelayDepth",   .min=0, .max=100, .def=100, .unit=kNT_unitPercent, .scaling=0, .enumStrings=NULL },
+    { .name = "PhaserDepth",  .min=0, .max=100, .def=100, .unit=kNT_unitPercent, .scaling=0, .enumStrings=NULL },
+    // CONTOUR
+    { .name = "Windows",    .min=1, .max=32,  .def=6,   .unit=kNT_unitNone,    .scaling=0, .enumStrings=NULL },
+    { .name = "Chaos",      .min=0, .max=100, .def=60,  .unit=kNT_unitPercent, .scaling=0, .enumStrings=NULL },
+    { .name = "Radius",     .min=0, .max=500, .def=120, .unit=kNT_unitMs,      .scaling=0, .enumStrings=NULL },
+    { .name = "Round prob", .min=0, .max=100, .def=100, .unit=kNT_unitPercent, .scaling=0, .enumStrings=NULL },
+    { .name = "Hold prob",  .min=0, .max=100, .def=0,   .unit=kNT_unitPercent, .scaling=0, .enumStrings=NULL },
+    // FILTERS
+    { .name = "Freq 1", .min=20, .max=16000, .def=200,  .unit=kNT_unitHz, .scaling=0, .enumStrings=NULL },
+    { .name = "Freq 2", .min=20, .max=16000, .def=600,  .unit=kNT_unitHz, .scaling=0, .enumStrings=NULL },
+    { .name = "Freq 3", .min=20, .max=16000, .def=1500, .unit=kNT_unitHz, .scaling=0, .enumStrings=NULL },
+    { .name = "Freq 4", .min=20, .max=16000, .def=4000, .unit=kNT_unitHz, .scaling=0, .enumStrings=NULL },
+    { .name = "BW 1", .min=1, .max=96, .def=48, .unit=kNT_unitSemitones, .scaling=0, .enumStrings=NULL },
+    { .name = "BW 2", .min=1, .max=96, .def=48, .unit=kNT_unitSemitones, .scaling=0, .enumStrings=NULL },
+    { .name = "BW 3", .min=1, .max=96, .def=48, .unit=kNT_unitSemitones, .scaling=0, .enumStrings=NULL },
+    { .name = "BW 4", .min=1, .max=96, .def=48, .unit=kNT_unitSemitones, .scaling=0, .enumStrings=NULL },
+    { .name = "VCFRND", .min=0, .max=1, .def=0, .unit=kNT_unitEnum, .scaling=0, .enumStrings=playStrings },
+    { .name = "QCONT",  .min=0, .max=1, .def=0, .unit=kNT_unitEnum, .scaling=0, .enumStrings=playStrings },
+    // SHIFTER
+    { .name = "BlockSize", .min=0, .max=6,   .def=3, .unit=kNT_unitEnum,    .scaling=0, .enumStrings=blockSizeStrings },
+    { .name = "Swaps",     .min=0, .max=100, .def=0, .unit=kNT_unitPercent, .scaling=0, .enumStrings=NULL },
+    { .name = "SwapSize",  .min=0, .max=100, .def=50,.unit=kNT_unitPercent, .scaling=0, .enumStrings=NULL },
+    { .name = "Omit",      .min=0, .max=100, .def=0, .unit=kNT_unitPercent, .scaling=0, .enumStrings=NULL },
+    // PLAYERS 1..4 (8 each)
+    PLAYER_PARAMS(1)
+    PLAYER_PARAMS(2)
+    PLAYER_PARAMS(3)
+    PLAYER_PARAMS(4)
+    // REST (globals)
+    { .name = "Threshold", .min=0, .max=100, .def=30, .unit=kNT_unitPercent, .scaling=0, .enumStrings=NULL },
+    { .name = "Xfade",     .min=1, .max=50,  .def=10, .unit=kNT_unitMs,      .scaling=0, .enumStrings=NULL },
+    { .name = "Slices",    .min=0, .max=6,   .def=0,  .unit=kNT_unitEnum,    .scaling=0, .enumStrings=slicesStrings },
+    { .name = "Hysteresis",.min=0, .max=12,  .def=1,  .unit=kNT_unitSemitones,.scaling=0,.enumStrings=NULL },
+    { .name = "Crossfade", .min=0, .max=100, .def=10, .unit=kNT_unitMs,      .scaling=0, .enumStrings=NULL },
+    // ROUTING
+    NT_PARAMETER_AUDIO_OUTPUT_WITH_MODE( "Output", 1, 13 )
+    { .name = "Note 1", .min=0, .max=127, .def=60, .unit=kNT_unitMIDINote, .scaling=0, .enumStrings=NULL },
+    { .name = "Note 2", .min=0, .max=127, .def=61, .unit=kNT_unitMIDINote, .scaling=0, .enumStrings=NULL },
+    { .name = "Note 3", .min=0, .max=127, .def=62, .unit=kNT_unitMIDINote, .scaling=0, .enumStrings=NULL },
+    { .name = "Note 4", .min=0, .max=127, .def=63, .unit=kNT_unitMIDINote, .scaling=0, .enumStrings=NULL },
 };
 
-static const uint8_t pageStarter[] = { kParamStarterFreq1, kParamStarterFreq2, kParamStarterFreq3, kParamStarterFreq4,
-                                       kParamStarterLen1, kParamStarterLen2, kParamStarterLen3, kParamStarterLen4 };
-static const uint8_t pageDepth[]   = { kParamP1Depth, kParamP2Depth, kParamP3Depth, kParamP4Depth };
-static const uint8_t pageRender[]  = { kParamRegenerate, kParamPlay, kParamOversample, kParamPitch, kParamNormLevel };
+static const uint8_t pageRender[]  = { kParamRegenerate, kParamPlay };
+static const uint8_t pageStarter[] = { kParamMinFreq, kParamMaxFreq, kParamMinLen, kParamMaxLen };
+static const uint8_t pageDepth[]   = { kParamShifterDepth, kParamFreqDepth, kParamDelayDepth, kParamPhaserDepth };
 static const uint8_t pageContour[] = { kParamWindows, kParamChaos, kParamRadius, kParamRoundProb, kParamHoldProb };
 static const uint8_t pageFilters[] = { kParamBpFreq1, kParamBpFreq2, kParamBpFreq3, kParamBpFreq4,
                                        kParamBpBw1, kParamBpBw2, kParamBpBw3, kParamBpBw4,
                                        kParamVcfRnd, kParamQCont };
-static const uint8_t pageProcessors[] = { kParamP1Enable, kParamP2Enable, kParamP3Enable, kParamP4Enable };
-static const uint8_t pageStretch[] = { kParamScale, kParamStretch, kParamThreshold, kParamXfade };
 static const uint8_t pageShifter[] = { kParamBlockSize, kParamSwaps, kParamSwapSize, kParamOmit };
-static const uint8_t pageRouting[] = { kParamOutput, kParamOutputMode };
+#define PLAYER_PAGE(P) { kParamPlayerBase+(P)*PF_COUNT+PF_StartPos, kParamPlayerBase+(P)*PF_COUNT+PF_Pitch, \
+                         kParamPlayerBase+(P)*PF_COUNT+PF_Attack,   kParamPlayerBase+(P)*PF_COUNT+PF_Release, \
+                         kParamPlayerBase+(P)*PF_COUNT+PF_Stretch,  kParamPlayerBase+(P)*PF_COUNT+PF_CF, \
+                         kParamPlayerBase+(P)*PF_COUNT+PF_Cutoff,   kParamPlayerBase+(P)*PF_COUNT+PF_SliceLen }
+static const uint8_t pagePlayer1[] = PLAYER_PAGE(0);
+static const uint8_t pagePlayer2[] = PLAYER_PAGE(1);
+static const uint8_t pagePlayer3[] = PLAYER_PAGE(2);
+static const uint8_t pagePlayer4[] = PLAYER_PAGE(3);
+static const uint8_t pageRest[]    = { kParamThreshold, kParamXfade, kParamSlices, kParamHyst, kParamCrossfade };
+static const uint8_t pageRouting[] = { kParamOutput, kParamOutputMode, kParamNote1, kParamNote2, kParamNote3, kParamNote4 };
 
 static const _NT_parameterPage pages[] = {
-    { .name = "Starter",    .numParams = ARRAY_SIZE( pageStarter ),    .group = 0, .params = pageStarter },
-    { .name = "Depth",      .numParams = ARRAY_SIZE( pageDepth ),      .group = 0, .params = pageDepth },
-    { .name = "Render",     .numParams = ARRAY_SIZE( pageRender ),     .group = 0, .params = pageRender },
-    { .name = "Contour",    .numParams = ARRAY_SIZE( pageContour ),    .group = 0, .params = pageContour },
-    { .name = "Filters",    .numParams = ARRAY_SIZE( pageFilters ),    .group = 0, .params = pageFilters },
-    { .name = "Processors", .numParams = ARRAY_SIZE( pageProcessors ), .group = 0, .params = pageProcessors },
-    { .name = "Stretch",    .numParams = ARRAY_SIZE( pageStretch ),    .group = 0, .params = pageStretch },
-    { .name = "Shifter",    .numParams = ARRAY_SIZE( pageShifter ),    .group = 0, .params = pageShifter },
-    { .name = "Routing",    .numParams = ARRAY_SIZE( pageRouting ),    .group = 0, .params = pageRouting },
+    { .name = "Render",   .numParams = ARRAY_SIZE( pageRender ),  .group = 0, .params = pageRender },
+    { .name = "Starter",  .numParams = ARRAY_SIZE( pageStarter ), .group = 0, .params = pageStarter },
+    { .name = "Depth",    .numParams = ARRAY_SIZE( pageDepth ),   .group = 0, .params = pageDepth },
+    { .name = "Contour",  .numParams = ARRAY_SIZE( pageContour ), .group = 0, .params = pageContour },
+    { .name = "Filters",  .numParams = ARRAY_SIZE( pageFilters ), .group = 0, .params = pageFilters },
+    { .name = "Shifter",  .numParams = ARRAY_SIZE( pageShifter ), .group = 0, .params = pageShifter },
+    { .name = "Player 1", .numParams = ARRAY_SIZE( pagePlayer1 ), .group = 0, .params = pagePlayer1 },
+    { .name = "Player 2", .numParams = ARRAY_SIZE( pagePlayer2 ), .group = 0, .params = pagePlayer2 },
+    { .name = "Player 3", .numParams = ARRAY_SIZE( pagePlayer3 ), .group = 0, .params = pagePlayer3 },
+    { .name = "Player 4", .numParams = ARRAY_SIZE( pagePlayer4 ), .group = 0, .params = pagePlayer4 },
+    { .name = "REST",     .numParams = ARRAY_SIZE( pageRest ),    .group = 0, .params = pageRest },
+    { .name = "Routing",  .numParams = ARRAY_SIZE( pageRouting ), .group = 0, .params = pageRouting },
 };
 
 static const _NT_parameterPages parameterPages = {
@@ -228,37 +687,29 @@ static const _NT_parameterPages parameterPages = {
 // Push all continuously-applied parameter values from v[] into the renderer.
 // Used at construct (v[] holds defaults there, per CLAUDE.md) and mirrored
 // per-parameter in parameterChanged.
+// Push the render-side (bake) parameters into the renderer. The per-player
+// playback params (StartPos/Pitch/Attack/Release/Stretch/CF/Cutoff/SliceLen)
+// and the globals (Threshold/Xfade/Slices/Hyst/Crossfade, Notes) are read live
+// in step(), not here. Oversample(1x), Norm level(8V) and all-processors-on are
+// now fixed (their parameters were removed 2026-10-24).
 static void applyAllParams( FourByFourAlg* a )
 {
     renderer::Renderer& r = a->engine->renderer;
-    for ( int i = 0; i < 4; ++i )
-    {
-        r.setStarterFreq( i, (float)a->v[kParamStarterFreq1 + i] );
-        r.setStarterDuration( i, (float)a->v[kParamStarterLen1 + i] * 0.001f );   // ms -> s
-    }
-    r.setP1DepthScale( (float)a->v[kParamP1Depth] / 100.0f );
-    r.setP2DepthScale( (float)a->v[kParamP2Depth] / 100.0f );
-    r.setP3DepthScale( (float)a->v[kParamP3Depth] / 100.0f );
-    r.setP4DepthScale( (float)a->v[kParamP4Depth] / 100.0f );
+    r.setStarterRanges( (float)a->v[kParamMinFreq], (float)a->v[kParamMaxFreq],
+                        (float)a->v[kParamMinLen] * 0.001f, (float)a->v[kParamMaxLen] * 0.001f );
+    r.setP1DepthScale( (float)a->v[kParamShifterDepth] / 100.0f );
+    r.setP2DepthScale( (float)a->v[kParamFreqDepth]    / 100.0f );
+    r.setP3DepthScale( (float)a->v[kParamDelayDepth]   / 100.0f );
+    r.setP4DepthScale( (float)a->v[kParamPhaserDepth]  / 100.0f );
 
-    // Static per-channel resonant bandpass (Filters page) — NOT Contour-
-    // modulated; center freq (Hz) + bandwidth (semitones). Applied to the
-    // biquads at the next render start (renderer.h).
     for ( int i = 0; i < 4; ++i )
     {
         r.setBandpassFreq( i, (float)a->v[kParamBpFreq1 + i] );
         r.setBandpassBw( i, (float)a->v[kParamBpBw1 + i] );
     }
-    // VCFRND: randomize bandpass center freqs every render (overrides Freq).
-    // QCONT: Contour-modulate bandpass Q/bandwidth (overrides static BW).
     r.setVcfRnd( a->v[kParamVcfRnd] != 0 );
     r.setQCont( a->v[kParamQCont] != 0 );
 
-    // Render output level: peak-normalize the kit to this many volts at playback.
-    r.setNormalizeLevel( (float)a->v[kParamNormLevel] );
-
-    // P1 spectral manipulation (Shifter page). BlockSize enum index -> bins;
-    // Swaps/SwapSize/Omit are percentages. Latched into P1's maps at next render.
     {
         int bsIdx = a->v[kParamBlockSize];
         if ( bsIdx < 0 ) bsIdx = 0;
@@ -269,30 +720,51 @@ static void applyAllParams( FourByFourAlg* a )
         r.setP1Omit( (float)a->v[kParamOmit] );
     }
 
-    // Global Contour settings bank (new "Contour" page). Stored as pending;
-    // the renderer applies them (reseed + rebuild) only at the next render
-    // start, and only if changed (see renderer.h). Per-instance seeding is
-    // unchanged — these are global settings with individual seeds.
     contourdest::SharedSettings cs;
     cs.windows   = (int)a->v[kParamWindows];
     cs.chaos     = (float)a->v[kParamChaos] / 100.0f;
-    cs.radiusSec = (float)a->v[kParamRadius] / 1000.0f;   // ms -> s
+    cs.radiusSec = (float)a->v[kParamRadius] / 1000.0f;
     cs.roundProb = (float)a->v[kParamRoundProb] / 100.0f;
     cs.holdProb  = (float)a->v[kParamHoldProb] / 100.0f;
     r.setSharedSettings( cs );
 
-    // Per-processor on/off (new "Processors" page). Muted channels add
-    // nothing to the mix or feedback; takes effect on the render currently
-    // baking and all later ones (re-bake to hear a change — an already-baked
-    // kit is fixed audio).
-    r.setProcessorEnabled( 0, a->v[kParamP1Enable] != 0 );
-    r.setProcessorEnabled( 1, a->v[kParamP2Enable] != 0 );
-    r.setProcessorEnabled( 2, a->v[kParamP3Enable] != 0 );
-    r.setProcessorEnabled( 3, a->v[kParamP4Enable] != 0 );
+    // Fixed now (parameters removed): 8V playback normalize, 1x oversample,
+    // all four processors always on.
+    r.setNormalizeLevel( 8.0f );
+    r.setOversample( 1 );
+    for ( int i = 0; i < 4; ++i ) r.setProcessorEnabled( i, true );
+}
 
-    // Oversampling factor (new on the Render page). Enum index 0..3 -> 1/2/4/8x
-    // (1 << index). Applied at the next render start (renderer.h).
-    r.setOversample( 1 << a->v[kParamOversample] );
+// Custom display for each player's Cutoff: a 0..1000 raw knob mapped
+// logarithmically to 20..20000 Hz, shown in Hz. 0 for anything else.
+int parameterString( _NT_algorithm* /*self*/, int p, int v, char* buff )
+{
+    bool isCutoff = false;
+    for ( int pl = 0; pl < 4; ++pl ) if ( p == playerParam( pl, PF_Cutoff ) ) isCutoff = true;
+    if ( !isCutoff ) return 0;
+    float hz = 20.0f * expf( (float)v / 1000.0f * 6.9077553f );
+    int len = NT_intToString( buff, (int32_t)( hz + 0.5f ) );
+    buff[len] = ' '; buff[len + 1] = 'H'; buff[len + 2] = 'z'; buff[len + 3] = 0;
+    return len + 3;
+}
+
+// MIDI note on/off gates the 4 players (omni; each listens to its Note param).
+void midiMessage( _NT_algorithm* self, uint8_t b0, uint8_t b1, uint8_t b2 )
+{
+    FourByFourAlg* a = (FourByFourAlg*)self;
+    int status = b0 & 0xF0;
+    bool noteOn  = ( status == 0x90 && b2 > 0 );
+    bool noteOff = ( status == 0x80 ) || ( status == 0x90 && b2 == 0 );
+    if ( !noteOn && !noteOff ) return;
+    int note = b1;
+    for ( int p = 0; p < 4; ++p )
+    {
+        if ( note == a->v[kParamNote1 + p] )
+        {
+            if ( noteOn ) a->players[p].noteOn();
+            else          a->players[p].noteOff();
+        }
+    }
 }
 
 void calculateRequirements( _NT_algorithmRequirements& req, const int32_t* /*specifications*/ )
@@ -340,76 +812,117 @@ void step( _NT_algorithm* self, float* busFrames, int numFramesBy4 )
     // on the same "read v[] live" pattern, with parameterChanged = NULL).
     applyAllParams( a );
 
-    // Regenerate: a momentary trigger, edge-detected (0->1) on the live v[]
-    // value here in step() rather than in parameterChanged — the earlier
-    // parameterChanged-based version did not reliably fire on the module.
-    // On the rising edge, start a fresh bake and reset the parameter to Hold
-    // so it behaves as a momentary button (NT_setParameterFromAudio is the
-    // intended way to write a parameter from the audio context).
+    // Regenerate: STICKY 0/1 switch (potentiometer, not a button). A fresh bake
+    // fires on the 0->1 edge; the value stays where the user leaves it.
     int regen = a->v[kParamRegenerate];
-    if ( regen == 1 && a->prevRegen == 0 )
-    {
-        a->engine->renderer.startNewRender();
-        int32_t idx = NT_algorithmIndex( self );
-        NT_setParameterFromAudio( idx, kParamRegenerate + NT_parameterOffset(), 0 );
-    }
-    // Re-read so the edge re-arms: once the auto-reset to Hold lands (this
-    // step if the write is synchronous, a later step if deferred), prevRegen
-    // becomes 0 and the next Hold->Regenerate counts as a fresh trigger.
-    // While the value is held at Regenerate, prevRegen stays 1 and we don't
-    // spam renders.
-    a->prevRegen = a->v[kParamRegenerate];
+    if ( regen == 1 && a->prevRegen == 0 ) a->engine->renderer.startNewRender();
+    a->prevRegen = regen;
 
-    // 1. Background render: advance one bounded chunk per step() call (§7).
+    // Background render: advance one bounded chunk per step() call (§7).
     a->engine->renderer.advanceChunk( a->engine->kit );
 
-    // 2. Player (interim Play/loop, §6).
     int n = numFramesBy4 * 4;
     int outBus = a->v[kParamOutput];
     if ( outBus < 1 ) return;
     float* out = busFrames + ( outBus - 1 ) * n;
     bool replace = a->v[kParamOutputMode];
     bool play    = a->v[kParamPlay];
-
     if ( !play )
     {
-        if ( replace )
-            for ( int i = 0; i < n; ++i ) out[i] = 0.0f;   // Play=Off -> silence
+        if ( replace ) for ( int i = 0; i < n; ++i ) out[i] = 0.0f;   // master off -> silence
         return;
     }
 
-    // Pitch via playback speed (Render page, +-48 semitones = +-4 octaves):
-    // ratio = 2^(semitones/12). Higher pitch reads the kit faster (shorter,
-    // higher); lower pitch reads it slower (longer, lower) — exactly as asked.
-    // Read live, so it takes effect immediately (pure playback, no re-bake).
-    float pitchSemis = (float)a->v[kParamPitch];
-    double pitchRatio = pow( 2.0, (double)pitchSemis / 12.0 );
-
     const kitbuffer::KitBuffer& kb = a->engine->kit.current();
     const timestretch::PeriodMaps& maps = a->engine->renderer.currentMaps( a->engine->kit );
-    // Peak-normalize to the Norm level param (live). Linear interpolation never
-    // overshoots its endpoints, so the output peak <= normGain*kitPeak = level,
-    // guaranteeing no clipping for any level <= 11V.
-    float normGain = a->engine->renderer.playbackGain();
-    // Per-sample advance in buffer samples = 32kHz->sampleRate conversion * pitch.
-    const double adv = ( (double)kitbuffer::kSampleRateHz / (double)NT_globals.sampleRate ) * pitchRatio;
+    float normGain = a->engine->renderer.playbackGain();   // 8V / kit peak
+    const float sr = (float)NT_globals.sampleRate;
+    const double kitConv = (double)kitbuffer::kSampleRateHz / (double)sr;
 
-    // Time-stretch (Stretch page). Period-synchronous, read-time only; at
-    // Stretch=100 (1.00x) this is bit-identical to the plain looping player.
-    timestretch::Params sp;
-    sp.scale01     = (float)a->v[kParamScale]     / 100.0f;
-    sp.stretch     = (float)a->v[kParamStretch]   / 100.0f;   // 1.00 .. 8.00
-    sp.threshold01 = (float)a->v[kParamThreshold] / 100.0f;
-    sp.xfadeMs     = (float)a->v[kParamXfade];
-
-    // Reset the read head when a fresh render has swapped in (new buffer + maps).
+    // Shared slice analysis (used by any CF-ON player). Re-analyse kit.current()
+    // after each render swap, chunked; rebuild the merged map at the global
+    // "Slices" grain. All 4 players read this one map.
     uint32_t gen = a->engine->renderer.swapGeneration();
-    if ( gen != a->lastSwapGen ) { a->reader.onSwap(); a->lastSwapGen = gen; }
+    a->lastSwapGen = gen;
+    bool anyCF = false;
+    for ( int p = 0; p < 4; ++p ) if ( a->v[playerParam( p, PF_CF )] != 0 ) anyCF = true;
+    if ( anyCF )
+    {
+        if ( a->sliceGen != gen ) { a->engine->sliceAnalysis.onBufferChanged( kb ); a->sliceGen = gen; }
+        a->engine->sliceAnalysis.analyzeChunk( kb );
+        a->engine->sliceAnalysis.rebuildIfNeeded( a->v[kParamSlices] );
+    }
 
+    // Global (REST page) stretch/CF settings shared by all players.
+    float gThreshold01 = (float)a->v[kParamThreshold] / 100.0f;
+    float gXfadeMs      = (float)a->v[kParamXfade];
+    float gHystSemis    = (float)a->v[kParamHyst];
+    float gCrossfadeMs  = (float)a->v[kParamCrossfade];
+
+    // Per-player per-block setup.
+    double            advP[4];
+    float             atkSamp[4], relSamp[4];
+    bool              cfP[4], audible[4];
+    timestretch::Params spP[4];
+    for ( int p = 0; p < 4; ++p )
+    {
+        Player& pl = a->players[p];
+        float startPos01 = (float)a->v[playerParam( p, PF_StartPos )] / 100.0f;
+        float pitchSemis = (float)a->v[playerParam( p, PF_Pitch )];
+        float stretchVal = (float)a->v[playerParam( p, PF_Stretch )] / 100.0f;   // 1.00..8.00
+        float sliceLenMs = (float)a->v[playerParam( p, PF_SliceLen )];
+        cfP[p]  = ( a->v[playerParam( p, PF_CF )] != 0 );
+        advP[p] = kitConv * pow( 2.0, (double)pitchSemis / 12.0 );
+        atkSamp[p] = (float)a->v[playerParam( p, PF_Attack )]  * 0.001f * sr;
+        relSamp[p] = (float)a->v[playerParam( p, PF_Release )] * 0.001f * sr;
+
+        // Note-on edge: reset the read head to StartPos and start the attack.
+        if ( pl.trig )
+        {
+            pl.trig = false;
+            pl.envState = Player::kAttack; pl.envCounter = 0.0f;
+            if ( cfP[p] ) pl.slice.retrigger();
+            else          pl.reader.start( (double)startPos01 * (double)kitbuffer::kNumSamples );
+        }
+        audible[p] = ( pl.envState != Player::kIdle );
+
+        if ( cfP[p] )
+        {
+            // StartPos -> rank offset among slices (filter offset); Cutoff picks
+            // the base nearest-centroid slice.
+            float cutoff01 = (float)a->v[playerParam( p, PF_Cutoff )] / 1000.0f;
+            pl.slice.selectPerBlock( a->engine->sliceAnalysis, cutoff01, startPos01,
+                                     gHystSemis, sliceLenMs, gCrossfadeMs, sr );
+        }
+        else
+        {
+            // SliceLen (CF off) maps to the stretch "scale" (which octave period
+            // to target): log-position of sliceLenMs across the 2..1024 ms set.
+            float sc = ( logf( sliceLenMs ) - 0.6931472f ) / ( 6.9314718f - 0.6931472f );
+            if ( sc < 0.0f ) sc = 0.0f;
+            if ( sc > 1.0f ) sc = 1.0f;
+            spP[p].scale01     = sc;
+            spP[p].stretch     = stretchVal;
+            spP[p].threshold01 = gThreshold01;
+            spP[p].xfadeMs     = gXfadeMs;
+        }
+    }
+
+    // Mix the 4 note-gated voices (each raw x its AHR envelope), normalize to
+    // 8V, soft-clip to +-11V so the summed voices can't hard-clip the bus.
     for ( int i = 0; i < n; ++i )
     {
-        float s = a->reader.process( kb, maps, sp, adv, normGain );
-        if ( replace ) out[i] = s; else out[i] += s;
+        float mix = 0.0f;
+        for ( int p = 0; p < 4; ++p )
+        {
+            if ( !audible[p] ) continue;
+            Player& pl = a->players[p];
+            float raw = cfP[p] ? pl.slice.processSample( kb, advP[p] )
+                               : pl.reader.process( kb, maps, spP[p], advP[p], 1.0f );
+            mix += raw * pl.envProcess( atkSamp[p], relSamp[p] );
+        }
+        mix = filters::softClip( mix * normGain );
+        if ( replace ) out[i] = mix; else out[i] += mix;
     }
 }
 
@@ -427,7 +940,7 @@ static const _NT_factory factory = {
     .step                         = step,
     .draw                         = NULL,
     .midiRealtime                 = NULL,
-    .midiMessage                  = NULL,
+    .midiMessage                  = midiMessage,   // note on/off gates the 4 players
     .tags                         = kNT_tagInstrument,
     .hasCustomUi                  = NULL,
     .customUi                     = NULL,
@@ -436,7 +949,7 @@ static const _NT_factory factory = {
     .deserialise                  = NULL,
     .midiSysEx                    = NULL,
     .parameterUiPrefix            = NULL,
-    .parameterString              = NULL,
+    .parameterString              = parameterString,   // Cutoff -> Hz readout
 };
 
 extern "C" uintptr_t pluginEntry( _NT_selector selector, uint32_t data )

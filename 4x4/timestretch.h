@@ -197,6 +197,9 @@ public:
         repeatsThisSeg_ = 0; primed_ = false; fading_ = false;
     }
     void onSwap() { reset(); }
+    // Restart the read head at a given buffer position (used by a note-gated
+    // player on note-on, so playback begins at its StartPos).
+    void start( double startPos ) { reset(); pos_ = startPos; }
 
     // kit + its maps (must belong together), params, per-sample advance `adv`
     // (= kit/out rate * pitch ratio), and the playback normalization gain.

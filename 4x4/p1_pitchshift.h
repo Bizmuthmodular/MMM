@@ -104,7 +104,9 @@ public:
     void onNewRender( uint32_t seed, int renderIndex )
     {
         float r = randomBaseFn ? randomBaseFn( seed, renderIndex ) : 0.5f;
-        baseSemitones_ = ( r * 2.0f - 1.0f ) * 24.0f;
+        // Base pitch range: -12 .. +24 st (asymmetric, 2026-10-25 user request;
+        // was +-24). Favours upward shifts while still allowing an octave down.
+        baseSemitones_ = -12.0f + r * 36.0f;
         frameIdx_ = 0;
         // Decorrelate the map RNG from the base-pitch draw; ensure nonzero.
         mapSeed_ = ( seed * 2654435761u + (uint32_t)renderIndex * 40503u + 0x51ED2C19u ) | 1u;
